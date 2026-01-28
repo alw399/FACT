@@ -17,7 +17,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, random_split
 
-from data import SequenceBigWigDataset
+from datas import SequenceBigWigDataset
 
 
 class BPNetModel(nn.Module):

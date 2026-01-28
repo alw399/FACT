@@ -139,7 +139,7 @@ class SequenceBigWigDataset(Dataset):
         chrom
             Chromosome name (e.g. 'chr3').
         window_size
-            Size of each window in bases.
+            Size of each window in bases. 
         stride
             Step between window starts. Defaults to window_size (non-overlapping).
         """

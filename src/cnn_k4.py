@@ -6,7 +6,7 @@ This builds off `cnn.py`:
 - Uses the same BPNetLoss and TrainConfig from `cnn.py`
 
 Expected dataset: `SequenceDualBigWigDataset` from `data.py`, which yields:
-    (sequence, methylation_bw, target_y, target_y_count)
+    (sequence, additional_y, target_y, target_y_count)
 where target_y is normalized (sums to 1 when >0) and target_y_count is the total count.
 """
 
@@ -30,7 +30,7 @@ class BPNetK4Model(nn.Module):
 
     Inputs:
       - sequence: (batch, 4, L_seq)
-      - methylation_bw: (batch, L_sig) or (batch, 1, L_sig)
+      - additional_y: (batch, L_sig) or (batch, 1, L_sig)
 
     The additional signal is interpolated to L_seq if needed, then concatenated
     to the sequence channels => (batch, 5, L_seq).
@@ -77,7 +77,7 @@ class BPNetK4Model(nn.Module):
             in_ch = hidden_channels
         self.encoder = nn.Sequential(*encoder_layers)
 
-        # Profile head (2 strands)
+        # Profile head (2 strands, like BPNetModel in cnn.py)
         profile_padding = (profile_kernel_size - 1) // 2
         self.profile_head = nn.Conv1d(
             in_channels=hidden_channels,
@@ -93,25 +93,29 @@ class BPNetK4Model(nn.Module):
             nn.Linear(hidden_channels, 1),
         )
 
-    def forward(self, sequence: torch.Tensor, methylation_bw: torch.Tensor):
+    def forward(self, sequence: torch.Tensor, additional_y: torch.Tensor):
         # Ensure additional has shape (B, 1, L_sig)
-        if methylation_bw.dim() == 2:
-            methylation_bw = methylation_bw.unsqueeze(1)
+        if additional_y.dim() == 2:
+            additional_y = additional_y.unsqueeze(1)
 
         # Match length to sequence length if binned
         L_seq = sequence.shape[-1]
-        if methylation_bw.shape[-1] != L_seq:
-            methylation_bw = nn.functional.interpolate(
-                methylation_bw, size=L_seq, mode="linear", align_corners=False
+        if additional_y.shape[-1] != L_seq:
+            additional_y = nn.functional.interpolate(
+                additional_y, size=L_seq, mode="linear", align_corners=False
             )
 
-        x = torch.cat([sequence, methylation_bw], dim=1)  # (B, 5, L_seq)
+        x = torch.cat([sequence, additional_y], dim=1)  # (B, 5, L_seq)
 
         h = self.encoder(x)  # (B, hidden, L_seq)
+
+        # Profile logits (no softmax here; BPNetLoss expects logits)
         profile_logits = self.profile_head(h)  # (B, 2, L_seq)
+
+        # Counts head predicts log-counts
         logcounts_pred = self.count_head(h)    # (B, 1)
 
-        # Match profile length to target bins
+        # Match profile length to target bins (like BPNetModel in cnn.py)
         if profile_logits.shape[-1] != self.output_len:
             profile_logits = nn.functional.interpolate(
                 profile_logits, size=self.output_len, mode="linear", align_corners=False
