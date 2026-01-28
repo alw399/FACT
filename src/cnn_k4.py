@@ -6,7 +6,7 @@ This builds off `cnn.py`:
 - Uses the same BPNetLoss and TrainConfig from `cnn.py`
 
 Expected dataset: `SequenceDualBigWigDataset` from `data.py`, which yields:
-    (sequence, additional_y, target_y, target_y_count)
+    (sequence, methylation_bw, target_y, target_y_count)
 where target_y is normalized (sums to 1 when >0) and target_y_count is the total count.
 """
 
@@ -30,7 +30,7 @@ class BPNetK4Model(nn.Module):
 
     Inputs:
       - sequence: (batch, 4, L_seq)
-      - additional_y: (batch, L_sig) or (batch, 1, L_sig)
+      - methylation_bw: (batch, L_sig) or (batch, 1, L_sig)
 
     The additional signal is interpolated to L_seq if needed, then concatenated
     to the sequence channels => (batch, 5, L_seq).
@@ -93,19 +93,19 @@ class BPNetK4Model(nn.Module):
             nn.Linear(hidden_channels, 1),
         )
 
-    def forward(self, sequence: torch.Tensor, additional_y: torch.Tensor):
+    def forward(self, sequence: torch.Tensor, methylation_bw: torch.Tensor):
         # Ensure additional has shape (B, 1, L_sig)
-        if additional_y.dim() == 2:
-            additional_y = additional_y.unsqueeze(1)
+        if methylation_bw.dim() == 2:
+            methylation_bw = methylation_bw.unsqueeze(1)
 
         # Match length to sequence length if binned
         L_seq = sequence.shape[-1]
-        if additional_y.shape[-1] != L_seq:
-            additional_y = nn.functional.interpolate(
-                additional_y, size=L_seq, mode="linear", align_corners=False
+        if methylation_bw.shape[-1] != L_seq:
+            methylation_bw = nn.functional.interpolate(
+                methylation_bw, size=L_seq, mode="linear", align_corners=False
             )
 
-        x = torch.cat([sequence, additional_y], dim=1)  # (B, 5, L_seq)
+        x = torch.cat([sequence, methylation_bw], dim=1)  # (B, 5, L_seq)
 
         h = self.encoder(x)  # (B, hidden, L_seq)
         profile_logits = self.profile_head(h)  # (B, 2, L_seq)
@@ -133,7 +133,7 @@ def train_bpnet_k4(
     """
     Train BPNetK4Model using BPNetLoss from `cnn.py`.
 
-    Dataset items must be: (sequence, additional_y, target_y, target_y_count)
+    Dataset items must be: (sequence, methylation_bw, target_y, target_y_count)
     where target_y is normalized profile and target_y_count is total count.
     """
     if config is None:

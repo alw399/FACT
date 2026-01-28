@@ -1,11 +1,10 @@
 """
 CNN-based predictor for CUT&RUN signal from mm10 sequence.
 
-This module defines a simple 1D convolutional neural network that
+This module defines a simple ML model based on BPNet that
 operates on one-hot encoded DNA (4 x L) and predicts a 1D signal
-profile (e.g. binned CUT&RUN bigWig values) for the same window.
-
-It also includes a minimal training loop that you can customize.
+profile (e.g. binned CUT&RUN bigWig values) for the same window
+and total counts.
 """
 
 from __future__ import annotations
