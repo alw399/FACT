@@ -21,7 +21,7 @@ from torch import nn
 from torch.utils.data import DataLoader, random_split
 
 from cnn import BPNetLoss, TrainConfig
-from data import SequenceDualBigWigDataset
+from datas import SequenceDualBigWigDataset
 
 
 class BPNetK4Model(nn.Module):
@@ -81,10 +81,11 @@ class BPNetK4Model(nn.Module):
         profile_padding = (profile_kernel_size - 1) // 2
         self.profile_head = nn.Conv1d(
             in_channels=hidden_channels,
-            out_channels=2,
+            out_channels=1,
             kernel_size=profile_kernel_size,
             padding=profile_padding,
         )
+        self.normalize_profile = nn.Softmax(dim=-1)
 
         # Counts head: predict log-counts (batch, 1)
         self.count_head = nn.Sequential(
@@ -109,9 +110,9 @@ class BPNetK4Model(nn.Module):
 
         h = self.encoder(x)  # (B, hidden, L_seq)
 
-        # Profile logits (no softmax here; BPNetLoss expects logits)
-        profile_logits = self.profile_head(h)  # (B, 2, L_seq)
-
+        profile_logits = self.profile_head(h)  # (B, 1, L_seq)
+        profile_logits = self.normalize_profile(profile_logits)
+        
         # Counts head predicts log-counts
         logcounts_pred = self.count_head(h)    # (B, 1)
 
@@ -196,20 +197,15 @@ def train_bpnet_k4(
             y = y.to(config.device)
             y_count = y_count.to(config.device)
 
-            # reconstruct counts per bin for multinomial term
-            counts_true = y_count.unsqueeze(-1)   # (B,1)
-            y_counts = y * counts_true            # (B,L)
-
             if train:
                 optimizer.zero_grad()
 
-            profile_logits, logcounts_pred = model(seq, add)
-            profile_logits_summed = profile_logits.sum(dim=1)  # (B,L)
+            profile_logits, counts_pred = model(seq, add)
             loss = criterion(
-                profile_logits_summed,
-                y_counts,
-                counts_pred=logcounts_pred,
-                counts_true=y_count.unsqueeze(-1),
+                profile_logits,
+                y,
+                counts_pred=counts_pred,
+                counts_true=y_count,
             )
 
             if train:
