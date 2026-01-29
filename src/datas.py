@@ -139,7 +139,7 @@ class SequenceBigWigDataset(Dataset):
         chrom
             Chromosome name (e.g. 'chr3').
         window_size
-            Size of each window in bases. 
+            Size of each window in bases.
         stride
             Step between window starts. Defaults to window_size (non-overlapping).
         """
@@ -204,6 +204,15 @@ class SequenceBigWigDataset(Dataset):
                 filtered_intervals.append(iv)
 
         self.intervals = filtered_intervals
+    
+    def get_count_loss_weight(self) -> float:
+        """
+        Get the count loss weight for the training loader.
+        """
+        tot_count = 0
+        for _, _, y_count in self:
+            tot_count += y_count.sum().item()
+        return tot_count / 2
   
     def __len__(self) -> int:
         return len(self.intervals)
@@ -271,7 +280,7 @@ class SequenceDualBigWigDataset(Dataset):
     def __init__(
         self,
         fasta_path: str,
-        additional_bigwig_path: str,
+        k4_bigwig_path: str,
         target_bigwig_path: str,
         intervals: Optional[Sequence[GenomicInterval]] = None,
         signal_bins: Optional[int] = None,
@@ -285,7 +294,7 @@ class SequenceDualBigWigDataset(Dataset):
         ----------
         fasta_path
             Path to an mm10 FASTA file.
-        additional_bigwig_path
+        k4_bigwig_path
             Path to the additional CUT&RUN bigWig file (used as input feature).
         target_bigwig_path
             Path to the target CUT&RUN bigWig file (what we want to predict).
@@ -312,12 +321,12 @@ class SequenceDualBigWigDataset(Dataset):
             raise ImportError("pyBigWig is required for SequenceDualBigWigDataset")
 
         self.fasta_path = fasta_path
-        self.additional_bigwig_path = additional_bigwig_path
+        self.k4_bigwig_path = k4_bigwig_path
         self.target_bigwig_path = target_bigwig_path
         self.signal_bins = signal_bins
 
         self._fasta = pyfaidx.Fasta(self.fasta_path, as_raw=True, sequence_always_upper=True)
-        self._bw_additional = pyBigWig.open(self.additional_bigwig_path)
+        self._bw_additional = pyBigWig.open(self.k4_bigwig_path)
         self._bw_target = pyBigWig.open(self.target_bigwig_path)
 
         # Basic validation: check that chromosomes overlap

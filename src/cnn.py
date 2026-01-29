@@ -10,7 +10,8 @@ and total counts.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
+import os
 
 import enlighten
 import torch
@@ -65,6 +66,15 @@ class BPNetModel(nn.Module):
         """
         super().__init__()
 
+        # Store configuration so that we can fully reconstruct the model
+        # from a checkpoint (see save_model / load_model helpers below).
+        self.seq_len = seq_len
+        self.n_channels = n_channels
+        self.hidden_channels = hidden_channels
+        self.n_encoder_layers = n_encoder_layers
+        self.kernel_size = kernel_size
+        self.profile_kernel_size = profile_kernel_size
+
         if output_len is None:
             output_len = seq_len
 
@@ -99,7 +109,6 @@ class BPNetModel(nn.Module):
             kernel_size=profile_kernel_size,
             padding=profile_padding,
         )
-        self.normalize_profile = nn.Softmax(dim=-1)
 
         # --- Count Head: Predicts HOW MUCH total signal ---
         self.count_head = nn.Sequential(
@@ -108,7 +117,6 @@ class BPNetModel(nn.Module):
             nn.Linear(hidden_channels, 1),  # (batch, 1)
         )
 
-        self.seq_len = seq_len
         self.output_len = output_len
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -130,7 +138,6 @@ class BPNetModel(nn.Module):
 
         # Profile head: predicts binding profile
         profile_logits = self.profile_head(h)  # (batch, 1, L)
-        profile_logits = self.normalize_profile(profile_logits)
 
         # Count head: predicts total counts
         counts = self.count_head(h)  # (batch, 1)
@@ -203,16 +210,16 @@ class BPNetLoss(nn.Module):
         profile_loss = -(y_true * log_pred_prob).sum(dim=-1)  # (batch,)
         profile_loss = profile_loss.mean()  # Average over batch
         
-        # --- Count loss: MSE on *log*-counts (to match BPNet) ---
+        # --- Count loss: MSE on *log*-counts ---
         #
         # In BPNet, the counts head predicts log-counts and the loss is
-        # typically MSE in log space (or Poisson on log-counts). Here we
-        # mirror the MSE-on-log-counts behavior.
+        # typically MSE in log space (or Poisson on log-counts)
         #
         y_true_total = counts_true.squeeze(-1)
         y_log_true = torch.log(torch.clamp(y_true_total, min=self.eps))
         y_log_pred = counts_pred.squeeze(-1)
         count_loss = torch.mean((y_log_true - y_log_pred) ** 2)
+
         # Combined loss
         total_loss = profile_loss + self.count_loss_weight * count_loss
         
@@ -225,7 +232,6 @@ class TrainConfig:
     weight_decay: float = 1e-6
     epochs: int = 10
     patience: int = 5
-    count_loss_weight: float = 0.1  # Lambda weight for count MSE loss in BPNetLoss (normalized, so smaller default)
     device: str = (
         "mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
         else "cuda" if torch.cuda.is_available()
@@ -310,7 +316,13 @@ def train_cnn_regressor(
         lr=config.lr,
         weight_decay=config.weight_decay,
     )
-    criterion = BPNetLoss(count_loss_weight=config.count_loss_weight)
+
+    # Get lambda parameter
+    tot_count = 0
+    for _, _, y_count in train_loader:
+        tot_count += y_count.sum().item()
+
+    criterion = BPNetLoss(count_loss_weight=tot_count/2)
 
     # Expose loaders and datasets on the model so that downstream
     # notebooks can reuse the exact same splits and sampling logic.
@@ -479,6 +491,8 @@ def visualize_split_predictions(
     model: nn.Module,
     device: str = "cpu",
     n_examples_per_split: int = 3,
+    loader: Optional[DataLoader] = None,
+    save_path: Optional[str] = None,
 ) -> None:
     """
     Visualize model predictions vs true signal for a few examples from
@@ -492,11 +506,16 @@ def visualize_split_predictions(
     model.eval()
     model.to(device)
 
-    loaders = {
-        "train": getattr(model, "train_loader", None),
-        "val": getattr(model, "val_loader", None),
-        "test": getattr(model, "test_loader", None),
-    }
+    if loader is None:
+        loaders = {
+            "train": getattr(model, "train_loader", None),
+            "val": getattr(model, "val_loader", None),
+            "test": getattr(model, "test_loader", None),
+        }
+    else:
+        loaders = {
+            "all": loader,
+        }
 
     for split_name, loader in loaders.items():
         if loader is None:
@@ -510,7 +529,13 @@ def visualize_split_predictions(
 
         it = iter(loader)
         for i in range(n_show):
-            x, y_true, y_count = next(it)
+            if type(model) == BPNetModel:
+                x, y_true, y_count = next(it)
+            else:
+                x, x_add, y_true, y_count = next(it)
+                x_add = x_add.to(device)
+                x_add = x_add[0:1]
+            
             x = x.to(device)
             y_true = y_true.to(device)
             y_count = y_count.to(device)
@@ -521,22 +546,100 @@ def visualize_split_predictions(
             y_count_single = y_count[0]  # scalar
 
             with torch.no_grad():
-                profile_logits, counts_pred = model(x_single)  # (1, 2, L), (1, 1)
-                # Sum forward/reverse profiles for CUT&RUN
-                y_pred = profile_logits.sum(dim=1).squeeze(0)  # (L,)
+                if type(model) == BPNetModel:
+                    profile_logits, counts_pred = model(x_single)  
+                else:
+                    profile_logits, counts_pred = model(x_single, x_add)
+
             # Plot normalized ground truth profile (y_true_single) and prediction
-            y_true_plot = y_true_single
+            y_pred = torch.softmax(profile_logits.squeeze(), dim=-1)
 
             ax = axes[i, 0]
-            ax.plot(y_true_plot.cpu().numpy(), label="true (normalized)", alpha=0.7)
+            ax.plot(y_true_single.cpu().numpy(), label="true", alpha=0.7)
             ax.plot(y_pred.cpu().numpy(), label="pred", alpha=0.7)
-            ax.set_title(f"{split_name} example {i+1} (total counts ~ {float(y_count_single):.1f}, predicted ~ {float(counts_pred.item()):.1f})")
+            ax.set_title(f"{split_name} example {i+1} (log counts: {float(y_count_single):.1f}, predicted: {float(counts_pred.item()):.1f})")
             ax.set_xlabel("Bins")
             ax.set_ylabel("Signal")
             ax.legend()
 
         plt.tight_layout()
-        plt.show()
+
+        if save_path is not None:
+            plt.savefig(f'{save_path}_{split_name}.png')
+            plt.close()
+        else:
+            plt.show()
+
+
+def save_model(model: BPNetModel, path: Union[str, "os.PathLike[str]"]) -> None:
+    """
+    Save a BPNetModel in a way that captures both its architecture
+    configuration and its learned parameters.
+
+    The saved checkpoint is a dictionary with:
+    - "model_class": class name (currently "BPNetModel")
+    - "model_kwargs": keyword arguments needed to reconstruct the model
+    - "state_dict": the model's state_dict
+    - "history": optional training history attached to the model
+    """
+    from pathlib import Path
+
+    p = Path(path)
+
+    model_kwargs = {
+        "seq_len": model.seq_len,
+        "n_channels": model.n_channels,
+        "hidden_channels": model.hidden_channels,
+        "n_encoder_layers": model.n_encoder_layers,
+        "kernel_size": model.kernel_size,
+        "profile_kernel_size": model.profile_kernel_size,
+        "output_len": model.output_len,
+    }
+
+    checkpoint = {
+        "model_class": model.__class__.__name__,
+        "model_kwargs": model_kwargs,
+        "state_dict": model.state_dict(),
+        "history": getattr(model, "history", None),
+    }
+
+    torch.save(checkpoint, p)
+
+
+def load_model(path: Union[str, "os.PathLike[str]"], device: Optional[str] = None) -> BPNetModel:
+    """
+    Load a BPNetModel saved with save_model().
+
+    This also supports older checkpoints that only contain a raw
+    state_dict (in that case you must construct the model yourself
+    before calling load_state_dict).
+    """
+    from pathlib import Path
+
+    p = Path(path)
+    if device is None:
+        map_location = None
+    else:
+        map_location = device
+
+    checkpoint = torch.load(p, map_location=map_location)
+
+    # New-style checkpoint saved by save_model
+    if isinstance(checkpoint, dict) and "state_dict" in checkpoint and "model_kwargs" in checkpoint:
+        model = BPNetModel(**checkpoint["model_kwargs"])
+        model.load_state_dict(checkpoint["state_dict"])
+        if checkpoint.get("history") is not None:
+            model.history = checkpoint["history"]
+        if device is not None:
+            model.to(device)
+        return model
+
+    # Fallback: assume this is a bare state_dict; caller must load it manually.
+    raise ValueError(
+        "Checkpoint does not contain model configuration. "
+        "It looks like a raw state_dict; construct BPNetModel manually "
+        "and call load_state_dict on it."
+    )
 
 
 __all__ = [
@@ -545,5 +648,7 @@ __all__ = [
     "TrainConfig",
     "train_cnn_regressor",
     "visualize_split_predictions",
+    "save_model",
+    "load_model",
 ]
 

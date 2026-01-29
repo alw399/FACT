@@ -77,7 +77,7 @@ class BPNetK4Model(nn.Module):
             in_ch = hidden_channels
         self.encoder = nn.Sequential(*encoder_layers)
 
-        # Profile head (2 strands, like BPNetModel in cnn.py)
+        # Profile head 
         profile_padding = (profile_kernel_size - 1) // 2
         self.profile_head = nn.Conv1d(
             in_channels=hidden_channels,
@@ -85,7 +85,6 @@ class BPNetK4Model(nn.Module):
             kernel_size=profile_kernel_size,
             padding=profile_padding,
         )
-        self.normalize_profile = nn.Softmax(dim=-1)
 
         # Counts head: predict log-counts (batch, 1)
         self.count_head = nn.Sequential(
@@ -111,7 +110,6 @@ class BPNetK4Model(nn.Module):
         h = self.encoder(x)  # (B, hidden, L_seq)
 
         profile_logits = self.profile_head(h)  # (B, 1, L_seq)
-        profile_logits = self.normalize_profile(profile_logits)
         
         # Counts head predicts log-counts
         logcounts_pred = self.count_head(h)    # (B, 1)
@@ -170,8 +168,14 @@ def train_bpnet_k4(
 
     model = BPNetK4Model(seq_len=seq_len, output_len=out_len).to(config.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-    criterion = BPNetLoss(count_loss_weight=config.count_loss_weight)
+    
+    # Get lambda parameter
+    tot_count = 0
+    for _, _, _, y_count in train_loader:
+        tot_count += y_count.sum().item()
 
+    criterion = BPNetLoss(count_loss_weight=tot_count/2)
+    
     # attach loaders for visualization
     model.train_loader = train_loader
     model.val_loader = val_loader
@@ -249,53 +253,5 @@ def train_bpnet_k4(
     model.history = {"train": train_losses, "val": val_losses, "final_test": test_loss}
     return model
 
-
-def visualize_split_predictions(model: nn.Module, device: str = "cpu", n_examples_per_split: int = 3) -> None:
-    """
-    Plot a few examples from train/val/test loaders attached to the model.
-    """
-    import matplotlib.pyplot as plt
-
-    model.eval()
-    model.to(device)
-
-    loaders = {
-        "train": getattr(model, "train_loader", None),
-        "val": getattr(model, "val_loader", None),
-        "test": getattr(model, "test_loader", None),
-    }
-    for split_name, loader in loaders.items():
-        if loader is None:
-            continue
-        n_show = min(n_examples_per_split, len(loader.dataset))
-        if n_show <= 0:
-            continue
-        fig, axes = plt.subplots(n_show, 1, figsize=(10, 3 * n_show), squeeze=False)
-        it = iter(loader)
-        for i in range(n_show):
-            seq, add, y, y_count = next(it)
-            seq = seq.to(device)
-            add = add.to(device)
-            y = y.to(device)
-            y_count = y_count.to(device)
-
-            seq1 = seq[0:1]
-            add1 = add[0:1]
-            y_true = y[0].detach().cpu().numpy()
-            total = float(y_count[0].detach().cpu())
-
-            with torch.no_grad():
-                profile_logits, _ = model(seq1, add1)
-                y_pred = profile_logits.sum(dim=1).squeeze(0).detach().cpu().numpy()
-
-            ax = axes[i, 0]
-            ax.plot(y_true, label="true (normalized)", alpha=0.7)
-            ax.plot(y_pred, label="pred (logits)", alpha=0.7)
-            ax.set_title(f"{split_name} example {i+1} (target total ~ {total:.1f})")
-            ax.legend()
-        plt.tight_layout()
-        plt.show()
-
-
-__all__ = ["BPNetK4Model", "train_bpnet_k4", "visualize_split_predictions"]
+__all__ = ["BPNetK4Model", "train_bpnet_k4"]
 
