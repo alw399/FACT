@@ -3,4 +3,4 @@ __pycache__
 bpnet
 models/*
 *.out
-
+motif_results/*

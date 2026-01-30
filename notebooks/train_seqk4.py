@@ -9,8 +9,10 @@ from cnn import *
 from datas import *
 import os
 
-bigwig_path = '../data/bws_for_predictor/SPT16_4D_6HdTAG_Sox2_S49_1_120_sorted.bw'
-k4_bigwig_path = '../data/bws_for_predictor/SPT16_4D_6HdTAG_K4_S55_150_500_scaled.bw'
+# bigwig_path = '../data/bws_for_predictor/SPT16_4D_6HdTAG_Sox2_S49_1_120_sorted.bw'
+# k4_bigwig_path = '../data/bws_for_predictor/SPT16_4D_6HdTAG_K4_S55_150_500_scaled.bw'
+bigwig_path = f'../data/bws_for_predictor/SPT16_4D_DMSO_Sox2_S40_1_120_sorted.bw'
+k4_bigwig_path = f'../data/bws_for_predictor/SPT16_4D_DMSO_K4_S31_150_500_scaled.bw'
 timepoint = os.path.basename(bigwig_path).split('_')[2]
 
 fasta_path = '../data/GRCm38.primary_assembly.genome.fa'
@@ -20,10 +22,10 @@ stride = 1000
 signal_bins = 100
 batch_size = 256
 epochs = 200
-lr = 1e-3
+lr = 5e-3
 device = 'cuda'
 weight_decay = 1e-4
-patience = 10
+patience = 30
 
 dataset = SequenceDualBigWigDataset(
     fasta_path=str(fasta_path),
@@ -52,7 +54,7 @@ model = train_bpnet_k4(
 import time
 from pathlib import Path
 
-date = time.strftime("%Y%m%d_%H")
+date = time.strftime("%Y%m%d%H")
 output_model_path = Path(f'../models/seqk4_{timepoint}_{date}.pt')
 
 save_model(model, output_model_path)
@@ -62,7 +64,7 @@ visualize_split_predictions(
     model,
     device='cuda',
     n_examples_per_split=10,
-    save_path=f'../models/results/seqk4_{timepoint}_{date}'
+    save_path=f'../models_v2/results/seqk4_{timepoint}_{date}'
 )
 
 

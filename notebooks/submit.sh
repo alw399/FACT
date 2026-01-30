@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH --output="train_seqk4200.out"
+#SBATCH --output="train_seqk4_dmso.out"
 #SBATCH --partition=l40s
 #SBATCH --gres=gpu:1
 #SBATCH --cluster=gpu
-#SBATCH --job-name="train_seqk4200" 
+#SBATCH --job-name="train_seqk4_dmso" 
 #SBATCH --cpus-per-task 1
 #SBATCH --time 0-12:00:00
 #SBATCH --mem 50G

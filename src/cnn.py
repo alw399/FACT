@@ -27,13 +27,10 @@ class BPNetModel(nn.Module):
     
     Architecture:
     - Encoder: Dilated convolutional stack (exponentially increasing dilation)
-    - Profile Head: Predicts binding profile (batch, 2, L) for forward/reverse strands
-    - Count Head: Predicts total counts (batch, 1)
+    - Profile Head: Predicts binary binding profile (batch, 1, L)
     
     Input:  (batch, 4, L) - one-hot encoded DNA
-    Output: (profile_logits, counts) where:
-        - profile_logits: (batch, 2, L) - logits for forward/reverse strand profiles
-        - counts: (batch, 1) - predicted total counts
+    Output: profile_logits of shape (batch, 1, L) - logits for binary classification
     """
 
     def __init__(
@@ -66,8 +63,6 @@ class BPNetModel(nn.Module):
         """
         super().__init__()
 
-        # Store configuration so that we can fully reconstruct the model
-        # from a checkpoint (see save_model / load_model helpers below).
         self.seq_len = seq_len
         self.n_channels = n_channels
         self.hidden_channels = hidden_channels
@@ -110,16 +105,9 @@ class BPNetModel(nn.Module):
             padding=profile_padding,
         )
 
-        # --- Count Head: Predicts HOW MUCH total signal ---
-        self.count_head = nn.Sequential(
-            nn.AdaptiveAvgPool1d(1),  # (batch, hidden, L) -> (batch, hidden, 1)
-            nn.Flatten(),              # (batch, hidden)
-            nn.Linear(hidden_channels, 1),  # (batch, 1)
-        )
-
         self.output_len = output_len
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Parameters
         ----------
@@ -129,18 +117,13 @@ class BPNetModel(nn.Module):
         Returns
         -------
         profile_logits
-            Tensor of shape (batch, 2, L_out) - logits for forward/reverse profiles.
-        counts
-            Tensor of shape (batch, 1) - predicted total counts.
+            Tensor of shape (batch, 1, L_out) - logits for binary classification.
         """
         # Encoder
         h = self.encoder(x)  # (batch, hidden_channels, L)
 
         # Profile head: predicts binding profile
-        profile_logits = self.profile_head(h)  # (batch, 1, L)
-
-        # Count head: predicts total counts
-        counts = self.count_head(h)  # (batch, 1)
+        profile_logits = self.profile_head(h)  # (batch, 1, L) - logits
 
         # Optionally crop/interpolate profile if output_len != seq_len.
         # This is needed when the sequence is long (e.g. 10kb) but the
@@ -154,76 +137,16 @@ class BPNetModel(nn.Module):
                 align_corners=False,
             )
 
-        return profile_logits, counts
+        return profile_logits
 
 
 class BPNetLoss(nn.Module):
-    """
-    BPNet-style loss combining:
-    1. Multinomial Negative Log-Likelihood for profile (distribution over positions)
-    2. MSE for total counts
-    
-    Total_Loss = Loss_profile + lambda * Loss_counts
-    """
-    
-    def __init__(self, count_loss_weight: float = 1.0, eps: float = 1e-8):
-        """
-        Parameters
-        ----------
-        count_loss_weight
-            Lambda weight for the count MSE loss (default 1.0, often 1-10).
-        eps
-            Small epsilon for numerical stability in log.
-        """
+    def __init__(self):
         super().__init__()
-        self.count_loss_weight = count_loss_weight
-        self.eps = eps
-    
-    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor, 
-                counts_pred: torch.Tensor, counts_true: torch.Tensor) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        y_pred
-            Predicted signal profile (logits), shape (batch, L) or (batch, 1, L).
-        y_true
-            Observed signal profile (counts), shape (batch, L) or (batch, 1, L).
-        counts_pred
-            Predicted total counts from separate head, shape (batch, 1).
-        counts_true
-            Observed total counts, shape (batch, 1).
-        
-        Returns
-        -------
-        Combined loss (scalar tensor).
-        """
-        # Ensure 2D: (batch, L)
-        if y_pred.dim() == 3:
-            y_pred = y_pred.squeeze(1)
-        if y_true.dim() == 3:
-            y_true = y_true.squeeze(1)
-        
-        # --- Profile loss: Multinomial NLL ---
-        log_pred_prob = torch.log_softmax(y_pred, dim=-1)  # (batch, L)
-        
-        # Multinomial NLL: -sum(observed_counts * log(predicted_probabilities))
-        profile_loss = -(y_true * log_pred_prob).sum(dim=-1)  # (batch,)
-        profile_loss = profile_loss.mean()  # Average over batch
-        
-        # --- Count loss: MSE on *log*-counts ---
-        #
-        # In BPNet, the counts head predicts log-counts and the loss is
-        # typically MSE in log space (or Poisson on log-counts)
-        #
-        y_true_total = counts_true.squeeze(-1)
-        y_log_true = torch.log(torch.clamp(y_true_total, min=self.eps))
-        y_log_pred = counts_pred.squeeze(-1)
-        count_loss = torch.mean((y_log_true - y_log_pred) ** 2)
+        self.criterion = nn.BCEWithLogitsLoss()
 
-        # Combined loss
-        total_loss = profile_loss + self.count_loss_weight * count_loss
-        
-        return total_loss
+    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        return self.criterion(y_pred.squeeze(), y_true.squeeze())
 
 
 @dataclass
@@ -257,10 +180,9 @@ def train_cnn_regressor(
     - Separate profile head (predicts binding profile) and count head (predicts total counts)
     - BPNetLoss combining multinomial NLL for profile and MSE for counts
 
-    This assumes that each dataset item returns (x, y, y_count) where
+    This assumes that each dataset item returns (x, y) where
     - x has shape (4, L) - one-hot encoded DNA sequence
-    - y has shape (L,) or (T,) - normalized CUT&RUN profile (sums to 1 when >0)
-    - y_count is a scalar total count for that window
+    - y has shape (L,) or (T,) - binary CUT&RUN signal (0s and 1s)
     """
     if config is None:
         config = TrainConfig()
@@ -304,7 +226,7 @@ def train_cnn_regressor(
     )
 
     # Peek at one batch to infer sequence and target lengths
-    x0, y0, y0_count = next(iter(train_loader))
+    x0, y0 = next(iter(train_loader))
     seq_len = x0.shape[-1]
     output_len = y0.shape[-1]
 
@@ -317,12 +239,7 @@ def train_cnn_regressor(
         weight_decay=config.weight_decay,
     )
 
-    # Get lambda parameter
-    tot_count = 0
-    for _, _, y_count in train_loader:
-        tot_count += y_count.sum().item()
-
-    criterion = BPNetLoss(count_loss_weight=tot_count/2)
+    criterion = BPNetLoss()
 
     # Expose loaders and datasets on the model so that downstream
     # notebooks can reuse the exact same splits and sampling logic.
@@ -354,20 +271,14 @@ def train_cnn_regressor(
             unit="batch",
             leave=False,
         )
-        for x, y, y_count in train_loader:
+        for x, y in train_loader:
             x = x.to(config.device)
             y = y.to(config.device)
-            y_count = y_count.to(config.device)
 
             optimizer.zero_grad()
-            profile_logits, counts_pred = model(x)  # (batch, 2, L), (batch, 1)
+            profile_logits = model(x)  # (batch, 1, L)
 
-            loss = criterion(
-                profile_logits,
-                y,
-                counts_pred=counts_pred,
-                counts_true=y_count,
-            )
+            loss = criterion(profile_logits, y)
             loss.backward()
             optimizer.step()
 
@@ -384,17 +295,11 @@ def train_cnn_regressor(
         val_loss_sum = 0.0
         val_batches = 0
         with torch.no_grad():
-            for x, y, y_count in val_loader:
+            for x, y in val_loader:
                 x = x.to(config.device)
                 y = y.to(config.device)
-                y_count = y_count.to(config.device)
-                profile_logits, counts_pred = model(x)
-                loss = criterion(
-                    profile_logits,
-                    y,
-                    counts_pred=counts_pred,
-                    counts_true=y_count,
-                )
+                profile_logits = model(x)
+                loss = criterion(profile_logits, y)
                 val_loss_sum += loss.item()
                 val_batches += 1
         avg_val_loss = val_loss_sum / max(val_batches, 1)
@@ -446,20 +351,11 @@ def train_cnn_regressor(
         total_loss = 0.0
         n_batches = 0
         with torch.no_grad():
-            for x, y, y_count in loader:
+            for x, y in loader:
                 x = x.to(config.device)
                 y = y.to(config.device)
-                y_count = y_count.to(config.device)
-                profile_logits, counts_pred = model(x)
-                profile_logits_summed = profile_logits.sum(dim=1)  # (batch, L)
-                counts_true = y_count.unsqueeze(-1)                # (batch, 1)
-                y_counts = y * counts_true                         # (batch, L)
-                loss = criterion(
-                    profile_logits_summed,
-                    y_counts,
-                    counts_pred=counts_pred,
-                    counts_true=counts_true,
-                )
+                profile_logits = model(x)
+                loss = criterion(profile_logits, y)
                 total_loss += loss.item()
                 n_batches += 1
         return total_loss / max(n_batches, 1)
@@ -530,34 +426,32 @@ def visualize_split_predictions(
         it = iter(loader)
         for i in range(n_show):
             if type(model) == BPNetModel:
-                x, y_true, y_count = next(it)
+                x, y_true = next(it)
             else:
-                x, x_add, y_true, y_count = next(it)
+                x, x_add, y_true = next(it)
                 x_add = x_add.to(device)
                 x_add = x_add[0:1]
             
             x = x.to(device)
             y_true = y_true.to(device)
-            y_count = y_count.to(device)
 
             # just take the first example
             x_single = x[0:1, :, :]      # Keep batch dimension: (1, 4, L)
             y_true_single = y_true[0, :] # (L,)
-            y_count_single = y_count[0]  # scalar
 
             with torch.no_grad():
                 if type(model) == BPNetModel:
-                    profile_logits, counts_pred = model(x_single)  
+                    profile_logits = model(x_single)  # (1, 1, L)
                 else:
-                    profile_logits, counts_pred = model(x_single, x_add)
+                    profile_logits = model(x_single, x_add)  # (1, 1, L)
 
-            # Plot normalized ground truth profile (y_true_single) and prediction
-            y_pred = torch.softmax(profile_logits.squeeze(), dim=-1)
+            # For binary classification, use sigmoid to get probabilities
+            y_pred = torch.sigmoid(profile_logits.squeeze())  # (L,)
 
             ax = axes[i, 0]
             ax.plot(y_true_single.cpu().numpy(), label="true", alpha=0.7)
             ax.plot(y_pred.cpu().numpy(), label="pred", alpha=0.7)
-            ax.set_title(f"{split_name} example {i+1} (log counts: {float(y_count_single):.1f}, predicted: {float(counts_pred.item()):.1f})")
+            ax.set_title(f"{split_name} example {i+1}")
             ax.set_xlabel("Bins")
             ax.set_ylabel("Signal")
             ax.legend()
@@ -624,7 +518,6 @@ def load_model(path: Union[str, "os.PathLike[str]"], device: Optional[str] = Non
 
     checkpoint = torch.load(p, map_location=map_location)
 
-    # New-style checkpoint saved by save_model
     if isinstance(checkpoint, dict) and "state_dict" in checkpoint and "model_kwargs" in checkpoint:
         model = BPNetModel(**checkpoint["model_kwargs"])
         model.load_state_dict(checkpoint["state_dict"])

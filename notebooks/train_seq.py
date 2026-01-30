@@ -51,7 +51,7 @@ import time
 from pathlib import Path
 
 date = time.strftime("%Y%m%d_%H")
-output_model_path = Path(f'../models/seq_{timepoint}_{date}.pt')
+output_model_path = Path(f'../models_v2/seq_{timepoint}_{date}.pt')
 
 save_model(model, output_model_path)
 print(f"Saved trained model (config + state_dict) to: {output_model_path}")
@@ -61,5 +61,5 @@ visualize_split_predictions(
     model,
     device=device,
     n_examples_per_split=10,
-    save_path=f'../models/results/seqk4_{timepoint}_{date}'
+    save_path=f'../models_v2/results/seq_{timepoint}_{date}'
 )

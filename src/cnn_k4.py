@@ -3,11 +3,11 @@ Multi-input BPNet-style model: sequence + additional bigWig -> target bigWig.
 
 This builds off `cnn.py`:
 - Uses the same BPNetModel-style encoder/heads idea (implemented here with 5 input channels)
-- Uses the same BPNetLoss and TrainConfig from `cnn.py`
+- Uses BPNetLoss (BCEWithLogitsLoss) and TrainConfig from `cnn.py`
 
-Expected dataset: `SequenceDualBigWigDataset` from `data.py`, which yields:
-    (sequence, additional_y, target_y, target_y_count)
-where target_y is normalized (sums to 1 when >0) and target_y_count is the total count.
+Expected dataset: `SequenceDualBigWigDataset` from `datas.py`, which yields:
+    (sequence, additional_y, target_y)
+where target_y is binary (0s and 1s).
 """
 
 from __future__ import annotations
@@ -36,8 +36,7 @@ class BPNetK4Model(nn.Module):
     to the sequence channels => (batch, 5, L_seq).
 
     Outputs:
-      - profile_logits: (batch, 2, L_out)
-      - logcounts_pred: (batch, 1)   (intended to be log-counts, as in BPNet)
+      - profile_logits: (batch, 1, L_out) - logits for binary classification
     """
 
     def __init__(
@@ -77,7 +76,7 @@ class BPNetK4Model(nn.Module):
             in_ch = hidden_channels
         self.encoder = nn.Sequential(*encoder_layers)
 
-        # Profile head 
+        # Profile head
         profile_padding = (profile_kernel_size - 1) // 2
         self.profile_head = nn.Conv1d(
             in_channels=hidden_channels,
@@ -86,14 +85,7 @@ class BPNetK4Model(nn.Module):
             padding=profile_padding,
         )
 
-        # Counts head: predict log-counts (batch, 1)
-        self.count_head = nn.Sequential(
-            nn.AdaptiveAvgPool1d(1),
-            nn.Flatten(),
-            nn.Linear(hidden_channels, 1),
-        )
-
-    def forward(self, sequence: torch.Tensor, additional_y: torch.Tensor):
+    def forward(self, sequence: torch.Tensor, additional_y: torch.Tensor) -> torch.Tensor:
         # Ensure additional has shape (B, 1, L_sig)
         if additional_y.dim() == 2:
             additional_y = additional_y.unsqueeze(1)
@@ -110,9 +102,6 @@ class BPNetK4Model(nn.Module):
         h = self.encoder(x)  # (B, hidden, L_seq)
 
         profile_logits = self.profile_head(h)  # (B, 1, L_seq)
-        
-        # Counts head predicts log-counts
-        logcounts_pred = self.count_head(h)    # (B, 1)
 
         # Match profile length to target bins (like BPNetModel in cnn.py)
         if profile_logits.shape[-1] != self.output_len:
@@ -120,7 +109,7 @@ class BPNetK4Model(nn.Module):
                 profile_logits, size=self.output_len, mode="linear", align_corners=False
             )
 
-        return profile_logits, logcounts_pred
+        return profile_logits
 
 
 def train_bpnet_k4(
@@ -134,10 +123,10 @@ def train_bpnet_k4(
     split_seed: int = 42,
 ) -> BPNetK4Model:
     """
-    Train BPNetK4Model using BPNetLoss from `cnn.py`.
+    Train BPNetK4Model using BPNetLoss (BCEWithLogitsLoss) from `cnn.py`.
 
-    Dataset items must be: (sequence, methylation_bw, target_y, target_y_count)
-    where target_y is normalized profile and target_y_count is total count.
+    Dataset items must be: (sequence, additional_y, target_y)
+    where target_y is binary (0s and 1s).
     """
     if config is None:
         config = TrainConfig()
@@ -162,20 +151,14 @@ def train_bpnet_k4(
     test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
     # Infer lengths
-    seq0, add0, y0, y0_count = next(iter(train_loader))
+    seq0, add0, y0 = next(iter(train_loader))
     seq_len = seq0.shape[-1]
     out_len = y0.shape[-1]
 
     model = BPNetK4Model(seq_len=seq_len, output_len=out_len).to(config.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-    
-    # Get lambda parameter
-    tot_count = 0
-    for _, _, _, y_count in train_loader:
-        tot_count += y_count.sum().item()
+    criterion = BPNetLoss()
 
-    criterion = BPNetLoss(count_loss_weight=tot_count/2)
-    
     # attach loaders for visualization
     model.train_loader = train_loader
     model.val_loader = val_loader
@@ -195,22 +178,16 @@ def train_bpnet_k4(
             model.train()
         else:
             model.eval()
-        for seq, add, y, y_count in loader:
+        for seq, add, y in loader:
             seq = seq.to(config.device)
             add = add.to(config.device)
             y = y.to(config.device)
-            y_count = y_count.to(config.device)
 
             if train:
                 optimizer.zero_grad()
 
-            profile_logits, counts_pred = model(seq, add)
-            loss = criterion(
-                profile_logits,
-                y,
-                counts_pred=counts_pred,
-                counts_true=y_count,
-            )
+            profile_logits = model(seq, add)
+            loss = criterion(profile_logits, y)
 
             if train:
                 loss.backward()
