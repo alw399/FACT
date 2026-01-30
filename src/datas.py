@@ -205,15 +205,6 @@ class SequenceBigWigDataset(Dataset):
 
         self.intervals = filtered_intervals
     
-    def get_count_loss_weight(self) -> float:
-        """
-        Get the count loss weight for the training loader.
-        """
-        tot_count = 0
-        for _, _, y_count in self:
-            tot_count += y_count.sum().item()
-        return tot_count / 2
-  
     def __len__(self) -> int:
         return len(self.intervals)
 
@@ -242,37 +233,27 @@ class SequenceBigWigDataset(Dataset):
                 type="mean",
             )
             vals = np.array(
-                [0.0 if v is None or np.isnan(v) else float(v) for v in stats],
+                [0.0 if v is None or np.isnan(v) or v <= 0 else float(1.0) for v in stats],
                 dtype=np.float32,
             )
 
-        # Total counts in this window
-        total_counts = float(vals.sum())
-        y_count = np.array(total_counts, dtype=np.float32)
-
-        # Normalize profile to [0, 1] (probability-like) if there is signal
-        if total_counts > 0.0:
-            vals_norm = vals / total_counts
-        else:
-            vals_norm = vals
-
         # Convert to torch tensors
         x = torch.from_numpy(one_hot)          # (4, L)
-        y = torch.from_numpy(vals_norm)        # normalized profile (L,) or (signal_bins,)
-        y_count_t = torch.from_numpy(y_count)  # total counts scalar
+        y = torch.from_numpy(vals)     
 
-        return x, y, y_count_t
+        return x, y
 
 
 class SequenceDualBigWigDataset(Dataset):
     """
-    Dataset that returns (sequence, additional_cutrun, target_cutrun) triplets.
+    Dataset that returns (sequence, additional_cutrun, target_y) triplets.
     
     For multi-input models that use both sequence and an additional CUT&RUN
     experiment to predict a target CUT&RUN signal.
 
     - Sequences are read from an mm10 FASTA file via pyfaidx.
     - Both CUT&RUN signals are read from bigWig files via pyBigWig.
+    - Target signal is binary (0s and 1s) when signal_bins is set.
 
     Each item corresponds to a fixed-length genomic window.
     """
@@ -392,11 +373,13 @@ class SequenceDualBigWigDataset(Dataset):
         seq = self._fasta[chrom][start:end]
         one_hot = one_hot_encode_sequence(str(seq))
 
-        def _get_signal(bw, chrom, start, end):
-            """Helper to extract signal from a bigWig."""
+        def _get_signal(bw, chrom, start, end, binary: bool = True):
+            """Helper to extract signal from a bigWig. If binary, returns 0/1 per bin."""
             if self.signal_bins is None:
                 vals = bw.values(chrom, start, end, numpy=True)
                 vals = np.nan_to_num(vals, nan=0.0).astype(np.float32)
+                if binary:
+                    vals = (vals > 0).astype(np.float32)
             else:
                 stats = bw.stats(
                     chrom,
@@ -405,35 +388,30 @@ class SequenceDualBigWigDataset(Dataset):
                     nBins=self.signal_bins,
                     type="mean",
                 )
-                vals = np.array(
-                    [0.0 if v is None or np.isnan(v) else float(v) for v in stats],
-                    dtype=np.float32,
-                )
+                if binary:
+                    vals = np.array(
+                        [0.0 if v is None or np.isnan(v) or v <= 0 else float(1.0) for v in stats],
+                        dtype=np.float32,
+                    )
+                else:
+                    vals = np.array(
+                        [0.0 if v is None or np.isnan(v) else float(v) for v in stats],
+                        dtype=np.float32,
+                    )
             return vals
 
-        # Additional CUT&RUN signal (input feature)
-        additional_vals = _get_signal(self._bw_additional, chrom, start, end)
-        additional_total = float(additional_vals.sum())
-        if additional_total > 0.0:
-            additional_norm = additional_vals / additional_total
-        else:
-            additional_norm = additional_vals
+        # Additional CUT&RUN signal (input feature) - normalized for richer input
+        additional_vals = _get_signal(self._bw_additional, chrom, start, end, binary=True)
 
-        # Target CUT&RUN signal (what we want to predict)
-        target_vals = _get_signal(self._bw_target, chrom, start, end)
-        target_total = float(target_vals.sum())
-        if target_total > 0.0:
-            target_norm = target_vals / target_total
-        else:
-            target_norm = target_vals
+        # Target CUT&RUN signal (what we want to predict) - binary 0/1
+        target_vals = _get_signal(self._bw_target, chrom, start, end, binary=True)
 
         # Convert to torch tensors
         sequence = torch.from_numpy(one_hot)  # (4, L)
-        additional_cutrun = torch.from_numpy(additional_norm)  # normalized profile (L,) or (signal_bins,)
-        target_y = torch.from_numpy(target_norm)               # normalized profile (L,) or (signal_bins,)
-        target_y_count = torch.tensor(target_total, dtype=torch.float32)  # scalar
+        additional_cutrun = torch.from_numpy(additional_vals)  # binary 0/1 (L,) or (signal_bins,)
+        target_y = torch.from_numpy(target_vals)  # binary 0/1 (L,) or (signal_bins,)
 
-        return sequence, additional_cutrun, target_y, target_y_count
+        return sequence, additional_cutrun, target_y
 
 
 __all__ = [
