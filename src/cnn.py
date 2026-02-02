@@ -465,13 +465,13 @@ def visualize_split_predictions(
             plt.show()
 
 
-def save_model(model: BPNetModel, path: Union[str, "os.PathLike[str]"]) -> None:
+def save_model(model: Union[BPNetModel, "nn.Module"], path: Union[str, "os.PathLike[str]"]) -> None:
     """
-    Save a BPNetModel in a way that captures both its architecture
+    Save a BPNetModel or BPNetK4Model in a way that captures both its architecture
     configuration and its learned parameters.
 
     The saved checkpoint is a dictionary with:
-    - "model_class": class name (currently "BPNetModel")
+    - "model_class": class name ("BPNetModel" or "BPNetK4Model")
     - "model_kwargs": keyword arguments needed to reconstruct the model
     - "state_dict": the model's state_dict
     - "history": optional training history attached to the model
@@ -479,19 +479,31 @@ def save_model(model: BPNetModel, path: Union[str, "os.PathLike[str]"]) -> None:
     from pathlib import Path
 
     p = Path(path)
+    class_name = model.__class__.__name__
 
-    model_kwargs = {
-        "seq_len": model.seq_len,
-        "n_channels": model.n_channels,
-        "hidden_channels": model.hidden_channels,
-        "n_encoder_layers": model.n_encoder_layers,
-        "kernel_size": model.kernel_size,
-        "profile_kernel_size": model.profile_kernel_size,
-        "output_len": model.output_len,
-    }
+    if class_name == "BPNetK4Model":
+        model_kwargs = {
+            "seq_len": model.seq_len,
+            "n_channels_seq": model.n_channels_seq,
+            "hidden_channels": model.hidden_channels,
+            "n_encoder_layers": model.n_encoder_layers,
+            "kernel_size": model.kernel_size,
+            "profile_kernel_size": model.profile_kernel_size,
+            "output_len": model.output_len,
+        }
+    else:
+        model_kwargs = {
+            "seq_len": model.seq_len,
+            "n_channels": model.n_channels,
+            "hidden_channels": model.hidden_channels,
+            "n_encoder_layers": model.n_encoder_layers,
+            "kernel_size": model.kernel_size,
+            "profile_kernel_size": model.profile_kernel_size,
+            "output_len": model.output_len,
+        }
 
     checkpoint = {
-        "model_class": model.__class__.__name__,
+        "model_class": class_name,
         "model_kwargs": model_kwargs,
         "state_dict": model.state_dict(),
         "history": getattr(model, "history", None),
@@ -500,9 +512,9 @@ def save_model(model: BPNetModel, path: Union[str, "os.PathLike[str]"]) -> None:
     torch.save(checkpoint, p)
 
 
-def load_model(path: Union[str, "os.PathLike[str]"], device: Optional[str] = None) -> BPNetModel:
+def load_model(path: Union[str, "os.PathLike[str]"], device: Optional[str] = None) -> Union[BPNetModel, "nn.Module"]:
     """
-    Load a BPNetModel saved with save_model().
+    Load a BPNetModel or BPNetK4Model saved with save_model().
 
     This also supports older checkpoints that only contain a raw
     state_dict (in that case you must construct the model yourself
@@ -519,7 +531,12 @@ def load_model(path: Union[str, "os.PathLike[str]"], device: Optional[str] = Non
     checkpoint = torch.load(p, map_location=map_location)
 
     if isinstance(checkpoint, dict) and "state_dict" in checkpoint and "model_kwargs" in checkpoint:
-        model = BPNetModel(**checkpoint["model_kwargs"])
+        model_class_name = checkpoint.get("model_class", "BPNetModel")
+        if model_class_name == "BPNetK4Model":
+            from cnn_k4 import BPNetK4Model
+            model = BPNetK4Model(**checkpoint["model_kwargs"])
+        else:
+            model = BPNetModel(**checkpoint["model_kwargs"])
         model.load_state_dict(checkpoint["state_dict"])
         if checkpoint.get("history") is not None:
             model.history = checkpoint["history"]
@@ -530,7 +547,7 @@ def load_model(path: Union[str, "os.PathLike[str]"], device: Optional[str] = Non
     # Fallback: assume this is a bare state_dict; caller must load it manually.
     raise ValueError(
         "Checkpoint does not contain model configuration. "
-        "It looks like a raw state_dict; construct BPNetModel manually "
+        "It looks like a raw state_dict; construct the model manually "
         "and call load_state_dict on it."
     )
 

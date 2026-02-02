@@ -53,6 +53,7 @@ class BPNetK4Model(nn.Module):
 
         self.seq_len = seq_len
         self.output_len = output_len
+        self.n_channels_seq = n_channels_seq
 
         n_in = n_channels_seq + 1  # +1 for additional bigWig channel
 
