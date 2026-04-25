@@ -3,7 +3,7 @@ Multi-input BPNet-style model: sequence + additional bigWig -> target bigWig.
 
 This builds off `cnn.py`:
 - Uses the same BPNetModel-style encoder/heads idea (implemented here with 5 input channels)
-- Uses BPNetLoss (BCEWithLogitsLoss) and TrainConfig from `cnn.py`
+- Uses BPNetLoss and TrainConfig from `cnn.py`
 
 Expected dataset: `SequenceDualBigWigDataset` from `datas.py`, which yields:
     (sequence, additional_y, target_y)
@@ -18,13 +18,14 @@ from typing import Optional
 import enlighten
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 
-from cnn import BPNetLoss, TrainConfig
+from cnn import BPNetModel, BPNetLoss, TrainConfig
 from datas import SequenceDualBigWigDataset
 
 
-class BPNetK4Model(nn.Module):
+class BPNetK4Model(BPNetModel):
     """
     BPNet-like model with an extra 1-channel signal input.
 
@@ -43,76 +44,41 @@ class BPNetK4Model(nn.Module):
         self,
         seq_len: int,
         output_len: int,
-        n_channels_seq: int = 4,
+        n_channels: int = 4,
         hidden_channels: int = 64,
         n_encoder_layers: int = 9,
         kernel_size: int = 25,
         profile_kernel_size: int = 75,
     ) -> None:
-        super().__init__()
-
-        self.seq_len = seq_len
-        self.output_len = output_len
+        super().__init__(
+            seq_len=seq_len,
+            n_channels=n_channels_seq + 1,
+            hidden_channels=hidden_channels,
+            n_encoder_layers=n_encoder_layers,
+            kernel_size=kernel_size,
+            profile_kernel_size=profile_kernel_size,
+            output_len=output_len,
+        )
         self.n_channels_seq = n_channels_seq
 
-        n_in = n_channels_seq + 1  # +1 for additional bigWig channel
-
-        # Encoder (same padding, dilated conv)
-        encoder_layers = []
-        in_ch = n_in
-        for i in range(n_encoder_layers):
-            dilation = 2**i
-            padding = (kernel_size - 1) * dilation // 2
-            encoder_layers.append(
-                nn.Conv1d(
-                    in_channels=in_ch,
-                    out_channels=hidden_channels,
-                    kernel_size=kernel_size,
-                    dilation=dilation,
-                    padding=padding,
-                )
-            )
-            encoder_layers.append(nn.BatchNorm1d(hidden_channels))
-            encoder_layers.append(nn.ReLU())
-            in_ch = hidden_channels
-        self.encoder = nn.Sequential(*encoder_layers)
-
-        # Profile head
-        profile_padding = (profile_kernel_size - 1) // 2
-        self.profile_head = nn.Conv1d(
-            in_channels=hidden_channels,
-            out_channels=1,
-            kernel_size=profile_kernel_size,
-            padding=profile_padding,
-        )
-
-    def forward(self, sequence: torch.Tensor, additional_y: torch.Tensor) -> torch.Tensor:
+    def forward(self, sequence: torch.Tensor, sequence_k4: torch.Tensor) -> torch.Tensor:
         # Ensure additional has shape (B, 1, L_sig)
-        if additional_y.dim() == 2:
-            additional_y = additional_y.unsqueeze(1)
+        if sequence_k4.dim() == 2:
+            sequence_k4 = sequence_k4.unsqueeze(1)
 
         # Match length to sequence length if binned
         L_seq = sequence.shape[-1]
-        if additional_y.shape[-1] != L_seq:
-            additional_y = nn.functional.interpolate(
-                additional_y, size=L_seq, mode="linear", align_corners=False
-            )
-
-        x = torch.cat([sequence, additional_y], dim=1)  # (B, 5, L_seq)
+        x = torch.cat([sequence, sequence_k4], dim=1)  # (B, 5, L_seq)
 
         h = self.encoder(x)  # (B, hidden, L_seq)
 
         profile_logits = self.profile_head(h)  # (B, 1, L_seq)
-
-        # Match profile length to target bins (like BPNetModel in cnn.py)
-        if profile_logits.shape[-1] != self.output_len:
-            profile_logits = nn.functional.interpolate(
-                profile_logits, size=self.output_len, mode="linear", align_corners=False
-            )
-
-        return profile_logits
-
-
+        profile_logits = self.mlp(profile_logits)
+        
+        total_counts = torch.sum(profile_logits, dim=-1)
+        return profile_logits, total_counts
+    
+    
 def train_bpnet_k4(
     dataset: SequenceDualBigWigDataset,
     batch_size: int = 32,
@@ -124,7 +90,7 @@ def train_bpnet_k4(
     split_seed: int = 42,
 ) -> BPNetK4Model:
     """
-    Train BPNetK4Model using BPNetLoss (BCEWithLogitsLoss) from `cnn.py`.
+    Train BPNetK4Model using BPNetLoss from `cnn.py`.
 
     Dataset items must be: (sequence, additional_y, target_y)
     where target_y is binary (0s and 1s).
@@ -157,8 +123,13 @@ def train_bpnet_k4(
     out_len = y0.shape[-1]
 
     model = BPNetK4Model(seq_len=seq_len, output_len=out_len).to(config.device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-    criterion = BPNetLoss()
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=config.lr, 
+        weight_decay=config.weight_decay
+    )
+    criterion = BPNetLoss(loss_type=config.loss_type)
+    model.loss_type = config.loss_type
 
     # attach loaders for visualization
     model.train_loader = train_loader
@@ -187,8 +158,9 @@ def train_bpnet_k4(
             if train:
                 optimizer.zero_grad()
 
-            profile_logits = model(seq, add)
-            loss = criterion(profile_logits, y)
+            profile_logits, pred_counts = model(seq, add)
+
+            loss = criterion(profile_logits, pred_counts, y)
 
             if train:
                 loss.backward()
@@ -228,8 +200,64 @@ def train_bpnet_k4(
     print(f"  Val:   {val_losses[-1]:.4f}")
     print(f"  Test:  {test_loss:.4f}")
 
-    model.history = {"train": train_losses, "val": val_losses, "final_test": test_loss}
+    # Attach full history and loaders to the model for later inspection/saving
+    model.history = {
+        "train": train_losses,
+        "val": val_losses,
+        "final": {
+            "train": train_losses[-1],
+            "val": val_losses[-1],
+            "test": test_loss,
+        },
+    }
     return model
 
-__all__ = ["BPNetK4Model", "train_bpnet_k4"]
+
+
+def save_model(model: nn.Module, model_kwargs: dict, path: str) -> None:
+    """Save the model architecture, parameters, and current history."""
+    import os
+    p = os.path.abspath(path)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+
+    class_name = model.__class__.__name__
+
+    checkpoint = {
+        "model_class": class_name,
+        "model_kwargs": model_kwargs,
+        "state_dict": model.state_dict(),
+        "history": getattr(model, "history", None),
+        "loss_type": getattr(model, "loss_type", "kldiv"),
+    }
+
+    torch.save(checkpoint, p)
+    print(f"Model saved to {p}")
+
+
+def load_model(path: str, device: Optional[str] = None) -> Union[BPNetK4Model]:
+    """Load model from checkpoint."""
+    import os
+    p = os.path.abspath(path)
+    if not os.path.exists(p):
+        raise FileNotFoundError(f"Checkpoint not found: {p}")
+
+    checkpoint = torch.load(p, map_location=device)
+    model_class_name = checkpoint["model_class"]
+    model_kwargs = checkpoint["model_kwargs"]
+
+    if model_class_name == "BPNetK4Model":
+        model = BPNetK4Model(**model_kwargs)
+        model.load_state_dict(checkpoint["state_dict"])
+        if checkpoint.get("history") is not None:
+            model.history = checkpoint["history"]
+        if checkpoint.get("loss_type") is not None:
+            model.loss_type = checkpoint["loss_type"]
+        if device is not None:
+            model.to(device)
+        return model
+    else:
+        raise ValueError(f"Unsupported model class: {model_class_name}")
+
+
+__all__ = ["BPNetK4Model", "train_bpnet_k4", "save_model", "load_model"]
 

@@ -16,27 +16,11 @@ from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
 import numpy as np
-
-
-try:
-    import torch
-    from torch.utils.data import Dataset
-except ImportError:  # pragma: no cover - allows importing without torch installed
-    torch = None
-    Dataset = object  # type: ignore
-
-
-try:
-    import pyfaidx  # for FASTA access
-except ImportError:  # pragma: no cover
-    pyfaidx = None
-
-
-try:
-    import pyBigWig  # for bigWig access
-except ImportError:  # pragma: no cover
-    pyBigWig = None
-
+import pandas as pd 
+import torch
+from torch.utils.data import Dataset
+import pyfaidx  # for FASTA access
+import pyBigWig  # for bigWig access
 
 NUC_TO_IDX = {
     "A": 0,
@@ -72,135 +56,85 @@ class GenomicInterval:
 
 
 def make_uniform_intervals(
-    chrom: str,
-    chrom_length: int,
+    bed: pd.DataFrame,
     window_size: int,
-    stride: Optional[int] = None,
 ) -> List[GenomicInterval]:
     """
     Convenience function: tile a chromosome with uniform windows.
 
     Parameters
     ----------
-    chrom
-        Chromosome name (e.g. 'chr3').
-    chrom_length
-        Length of the chromosome in bases.
+    bed
+        BED file containing genomic intervals. Assume TSS is at start 
     window_size
         Size of each window in bases.
-    stride
-        Step between window starts. Defaults to window_size
-        (non-overlapping windows).
     """
-    if stride is None:
-        stride = window_size
 
     intervals: List[GenomicInterval] = []
-    for start in range(0, chrom_length - window_size + 1, stride):
-        end = start + window_size
-        intervals.append(GenomicInterval(chrom=chrom, start=start, end=end))
+
+    bed['band_start'] = bed['start'] - window_size 
+    bed['band_end'] = bed['start'] + window_size 
+    
+    for chrom in bed['#chrom'].unique():
+        chrom_bed = bed[bed['#chrom'] == chrom]
+        intervals.extend([
+            GenomicInterval(chrom=chrom, start=start, end=end) 
+            for start, end in zip(chrom_bed['band_start'], chrom_bed['band_end'])
+        ])
     return intervals
 
 
-class SequenceBigWigDataset(Dataset):
+class GenomicDatasetBase(Dataset):
     """
-    Dataset that returns (one_hot_sequence, cutrun_signal) pairs.
-
-    - Sequences are read from an mm10 FASTA file via pyfaidx.
-    - CUT&RUN signal is read from a bigWig via pyBigWig.
-
-    Each item corresponds to a fixed-length genomic window.
+    Base class for datasets mapping DNA sequence to BigWig signals.
+    
+    Handles FASTA and BED loading, interval generation around BED regions,
+    and filtering based on signal presence.
     """
-
     def __init__(
         self,
         fasta_path: str,
-        bigwig_path: str,
+        bed_path: str,
+        reference_bw_path: str,
         signal_bins: Optional[int] = None,
-        chrom: Optional[str] = None,
-        window_size: int = 10000,
-        stride: Optional[int] = None,
+        window_size: int = 1000,
+        binarize_signal: bool = False,
+        normalize_signal: bool = True
     ) -> None:
-        """
-        Parameters
-        ----------
-        fasta_path
-            Path to an mm10 FASTA file (not provided in this repo;
-            download separately and supply the path).
-        bigwig_path
-            Path to CUT&RUN bigWig file.
-        intervals
-            Optional iterable of `GenomicInterval` objects; each defines a window
-            to extract. If None, intervals will be automatically generated.
-        signal_bins
-            If not None, downsample the bigWig signal into this many bins
-            per interval using pyBigWig.stats. If None, return per-base
-            values with `values()` (can be large).
-        chrom
-            Chromosome name (e.g. 'chr3').
-        window_size
-            Size of each window in bases.
-        stride
-            Step between window starts. Defaults to window_size (non-overlapping).
-        """
         if pyfaidx is None:
-            raise ImportError("pyfaidx is required for SequenceBigWigDataset")
+            raise ImportError("pyfaidx is required for GenomicDatasetBase")
         if pyBigWig is None:
-            raise ImportError("pyBigWig is required for SequenceBigWigDataset")
+            raise ImportError("pyBigWig is required for GenomicDatasetBase")
 
         self.fasta_path = fasta_path
-        self.bigwig_path = bigwig_path
+        self.bed_path = bed_path
+        self.reference_bw_path = reference_bw_path
         self.signal_bins = signal_bins
+        self.binarize_signal = binarize_signal
+        self.normalize_signal = normalize_signal
+        self.window_size = window_size
 
         self._fasta = pyfaidx.Fasta(self.fasta_path, as_raw=True, sequence_always_upper=True)
-        self._bw = pyBigWig.open(self.bigwig_path)
+        self._bw_ref = pyBigWig.open(reference_bw_path)
+        self._bed = pd.read_csv(self.bed_path, sep="\t")
+        self._k4_scale_factor = self._get_scale_factor(self._bw_ref)
 
-        # Basic validation: check that chromosomes overlap
-        fasta_chroms = set(self._fasta.keys())
-        bw_chroms = set(self._bw.chroms().keys())
-        common = fasta_chroms & bw_chroms
-        if not common:
-            raise ValueError("No overlapping chromosomes between FASTA and bigWig.")
-
-        # Generate intervals
-        if chrom is None:
-            raise ValueError(
-                "Either 'intervals' or 'chrom' must be provided. "
-                "If 'chrom' is provided, intervals will be automatically generated."
-            )
-        chrom_length = self._bw.chroms().get(chrom)
-        if chrom_length is None:
-            raise ValueError(
-                f"Chromosome {chrom} not found in bigWig file. "
-                f"Available chromosomes: {sorted(common)}"
-            )
-        if stride is None:
-            stride = window_size
-        # Initial tiling of the chromosome
+        # Tile chromosome windows around BED regions
         intervals = make_uniform_intervals(
-            chrom=chrom,
-            chrom_length=chrom_length,
+            bed=self._bed,
             window_size=window_size,
-            stride=stride,
         )
 
-        # Filter out intervals where the total signal (y) is zero.
-        # This avoids training on completely empty windows.
+        # Filter out intervals where the reference signal is zero or NaN.
         filtered_intervals: List[GenomicInterval] = []
         for iv in intervals:
-            # Use pyBigWig.stats with type="sum" to get total signal
-            total = self._bw.stats(
-                iv.chrom,
-                iv.start,
-                iv.end,
-                type="sum",
-            )[0]
-            if total is None or np.isnan(total):
-                total_val = 0.0
-            else:
-                total_val = float(total)
+            try:
+                stats = self._bw_ref.stats(iv.chrom, iv.start, iv.end, type="mean")
+                total = stats[0] if stats else 0
+            except Exception:
+                total = 0
 
-            if total_val > 0.0:
+            if total is not None and not np.isnan(total) and total > 0.0:
                 filtered_intervals.append(iv)
 
         self.intervals = filtered_intervals
@@ -208,10 +142,83 @@ class SequenceBigWigDataset(Dataset):
     def __len__(self) -> int:
         return len(self.intervals)
 
-    def __getitem__(self, idx: int):
-        if torch is None:
-            raise ImportError("PyTorch is required to use this dataset.")
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # Remove non-picklable file handles
+        state.pop("_fasta", None)
+        state.pop("_bw_ref", None)
+        return state
 
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        # Re-open file handles
+        self._fasta = pyfaidx.Fasta(self.fasta_path, as_raw=True, sequence_always_upper=True)
+        self._bw_ref = pyBigWig.open(self.reference_bw_path)
+
+    def _get_signal(self, bw: pyBigWig.BigWigFile, chrom: str, start: int, end: int) -> np.ndarray:
+        """Helper to extract and preprocess signal from a bigWig."""
+        if self.signal_bins is None:
+            vals = bw.values(chrom, start, end, numpy=True)
+        else:
+            stats = bw.stats(chrom, start, end, nBins=self.signal_bins, type="mean")
+            vals = np.array(stats, dtype=np.float32)
+        
+        vals = np.nan_to_num(vals, nan=0.0).astype(np.float32)
+
+        if self.binarize_signal:
+            vals = (vals > 0).astype(np.float32)
+        elif self.normalize_signal:
+            max_val = np.nanmax(vals)
+            if max_val > 0:
+                vals = vals / max_val
+        
+        return np.nan_to_num(vals, nan=0.0).astype(np.float32)
+    
+    def _get_scale_factor(self, bw):
+        max_val = 1
+        for chr in self._bed['#chrom'].unique():
+            stats = bw.stats(chrom=chr, type='max')[0]
+            if stats > max_val:
+                max_val = stats
+        return max_val
+
+
+class SequenceBigWigDataset(GenomicDatasetBase):
+    """
+    Dataset that returns (one_hot_sequence, cutrun_signal) pairs.
+    """
+    def __init__(
+        self,
+        fasta_path: str,
+        bigwig_path: str,
+        bed_path: str,
+        signal_bins: Optional[int] = None,
+        window_size: int = 1000,
+        binarize_signal: bool = False,
+        normalize_signal: bool = True
+    ) -> None:
+        super().__init__(
+            fasta_path=fasta_path,
+            bed_path=bed_path,
+            reference_bw_path=bigwig_path,
+            signal_bins=signal_bins,
+            window_size=window_size,
+            binarize_signal=binarize_signal,
+            normalize_signal=normalize_signal
+        )
+        self.bigwig_path = bigwig_path
+        self._bw = self._bw_ref
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        state.pop("_bw", None)
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        self._bw = self._bw_ref
+
+    def __getitem__(self, idx: int):
         interval = self.intervals[idx]
         chrom, start, end = interval.chrom, interval.start, interval.end
 
@@ -219,153 +226,57 @@ class SequenceBigWigDataset(Dataset):
         seq = self._fasta[chrom][start:end]
         one_hot = one_hot_encode_sequence(str(seq))
 
-        # CUT&RUN signal from bigWig
-        if self.signal_bins is None:
-            vals = self._bw.values(chrom, start, end, numpy=True)
-            # pyBigWig uses NaN for missing; convert to 0
-            vals = np.nan_to_num(vals, nan=0.0).astype(np.float32)
-        else:
-            stats = self._bw.stats(
-                chrom,
-                start,
-                end,
-                nBins=self.signal_bins,
-                type="mean",
-            )
-            vals = np.array(
-                [0.0 if v is None or np.isnan(v) or v <= 0 else float(1.0) for v in stats],
-                dtype=np.float32,
-            )
+        # Signal from BigWig
+        vals = self._get_signal(self._bw, chrom, start, end)
 
         # Convert to torch tensors
         x = torch.from_numpy(one_hot)          # (4, L)
         y = torch.from_numpy(vals)     
-
         return x, y
 
 
-class SequenceDualBigWigDataset(Dataset):
+class SequenceDualBigWigDataset(GenomicDatasetBase):
     """
-    Dataset that returns (sequence, additional_cutrun, target_y) triplets.
-    
-    For multi-input models that use both sequence and an additional CUT&RUN
-    experiment to predict a target CUT&RUN signal.
-
-    - Sequences are read from an mm10 FASTA file via pyfaidx.
-    - Both CUT&RUN signals are read from bigWig files via pyBigWig.
-    - Target signal is binary (0s and 1s) when signal_bins is set.
-
-    Each item corresponds to a fixed-length genomic window.
+    Dataset that returns (sequence, k4_cutrun, target_y) triplets.
     """
-
     def __init__(
         self,
         fasta_path: str,
         k4_bigwig_path: str,
         target_bigwig_path: str,
-        intervals: Optional[Sequence[GenomicInterval]] = None,
+        bed_path: str,
         signal_bins: Optional[int] = None,
-        chrom: Optional[str] = None,
-        window_size: int = 10000,
-        stride: Optional[int] = None,
-        drop_zero_target: bool = True,
+        window_size: int = 1000,
+        binarize_signal: bool = False,
+        normalize_signal: bool = True
     ) -> None:
-        """
-        Parameters
-        ----------
-        fasta_path
-            Path to an mm10 FASTA file.
-        k4_bigwig_path
-            Path to the additional CUT&RUN bigWig file (used as input feature).
-        target_bigwig_path
-            Path to the target CUT&RUN bigWig file (what we want to predict).
-        intervals
-            Optional iterable of `GenomicInterval` objects; each defines a window
-            to extract. If None, intervals will be automatically generated.
-        signal_bins
-            If not None, downsample the bigWig signals into this many bins
-            per interval using pyBigWig.stats. If None, return per-base
-            values with `values()` (can be large).
-        chrom
-            Chromosome name (e.g. 'chr3'). Required if intervals is None.
-        window_size
-            Size of each window in bases. Used only if intervals is None.
-        stride
-            Step between window starts. Defaults to window_size (non-overlapping).
-            Used only if intervals is None.
-        drop_zero_target
-            If True, drop intervals whose *target* total signal is 0.
-        """
-        if pyfaidx is None:
-            raise ImportError("pyfaidx is required for SequenceDualBigWigDataset")
-        if pyBigWig is None:
-            raise ImportError("pyBigWig is required for SequenceDualBigWigDataset")
-
-        self.fasta_path = fasta_path
+        super().__init__(
+            fasta_path=fasta_path,
+            bed_path=bed_path,
+            reference_bw_path=target_bigwig_path,
+            signal_bins=signal_bins,
+            window_size=window_size,
+            binarize_signal=binarize_signal,
+            normalize_signal=normalize_signal
+        )
         self.k4_bigwig_path = k4_bigwig_path
         self.target_bigwig_path = target_bigwig_path
-        self.signal_bins = signal_bins
+        self._bw_k4 = pyBigWig.open(self.k4_bigwig_path)
+        self._bw_target = self._bw_ref
+        self._k4_scale_factor = self._get_scale_factor(self._bw_k4)
 
-        self._fasta = pyfaidx.Fasta(self.fasta_path, as_raw=True, sequence_always_upper=True)
-        self._bw_additional = pyBigWig.open(self.k4_bigwig_path)
-        self._bw_target = pyBigWig.open(self.target_bigwig_path)
+    def __getstate__(self):
+        state = super().__getstate__()
+        state.pop("_bw_k4", None)
+        state.pop("_bw_target", None)
+        return state
 
-        # Basic validation: check that chromosomes overlap
-        fasta_chroms = set(self._fasta.keys())
-        bw_additional_chroms = set(self._bw_additional.chroms().keys())
-        bw_target_chroms = set(self._bw_target.chroms().keys())
-        common = fasta_chroms & bw_additional_chroms & bw_target_chroms
-        if not common:
-            raise ValueError(
-                "No overlapping chromosomes between FASTA and both bigWig files."
-            )
-
-        # Generate intervals if not provided
-        if intervals is None:
-            if chrom is None:
-                raise ValueError(
-                    "Either 'intervals' or 'chrom' must be provided. "
-                    "If 'chrom' is provided, intervals will be automatically generated."
-                )
-            # Use target bigWig to get chromosome length (they should all have same chroms)
-            chrom_length = self._bw_target.chroms().get(chrom)
-            if chrom_length is None:
-                raise ValueError(
-                    f"Chromosome {chrom} not found in bigWig files. "
-                    f"Available chromosomes: {sorted(common)}"
-                )
-            if stride is None:
-                stride = window_size
-            intervals = make_uniform_intervals(
-                chrom=chrom,
-                chrom_length=chrom_length,
-                window_size=window_size,
-                stride=stride,
-            )
-            # Optionally drop windows where target has zero total signal
-            if drop_zero_target:
-                filtered: List[GenomicInterval] = []
-                for iv in intervals:
-                    total = self._bw_target.stats(iv.chrom, iv.start, iv.end, type="sum")[0]
-                    if total is None or np.isnan(total):
-                        total_val = 0.0
-                    else:
-                        total_val = float(total)
-                    if total_val > 0.0:
-                        filtered.append(iv)
-                self.intervals = filtered
-            else:
-                self.intervals = list(intervals)
-        else:
-            self.intervals: List[GenomicInterval] = list(intervals)
-
-    def __len__(self) -> int:
-        return len(self.intervals)
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        self._bw_k4 = pyBigWig.open(self.k4_bigwig_path)
+        self._bw_target = self._bw_ref
 
     def __getitem__(self, idx: int):
-        if torch is None:
-            raise ImportError("PyTorch is required to use this dataset.")
-
         interval = self.intervals[idx]
         chrom, start, end = interval.chrom, interval.start, interval.end
 
@@ -373,45 +284,18 @@ class SequenceDualBigWigDataset(Dataset):
         seq = self._fasta[chrom][start:end]
         one_hot = one_hot_encode_sequence(str(seq))
 
-        def _get_signal(bw, chrom, start, end, binary: bool = True):
-            """Helper to extract signal from a bigWig. If binary, returns 0/1 per bin."""
-            if self.signal_bins is None:
-                vals = bw.values(chrom, start, end, numpy=True)
-                vals = np.nan_to_num(vals, nan=0.0).astype(np.float32)
-                if binary:
-                    vals = (vals > 0).astype(np.float32)
-            else:
-                stats = bw.stats(
-                    chrom,
-                    start,
-                    end,
-                    nBins=self.signal_bins,
-                    type="mean",
-                )
-                if binary:
-                    vals = np.array(
-                        [0.0 if v is None or np.isnan(v) or v <= 0 else float(1.0) for v in stats],
-                        dtype=np.float32,
-                    )
-                else:
-                    vals = np.array(
-                        [0.0 if v is None or np.isnan(v) else float(v) for v in stats],
-                        dtype=np.float32,
-                    )
-            return vals
+        # k4 CUT&RUN signal (input feature)
+        k4_vals = self._get_signal(self._bw_k4, chrom, start, end) / self._k4_scale_factor
 
-        # Additional CUT&RUN signal (input feature) - normalized for richer input
-        additional_vals = _get_signal(self._bw_additional, chrom, start, end, binary=True)
-
-        # Target CUT&RUN signal (what we want to predict) - binary 0/1
-        target_vals = _get_signal(self._bw_target, chrom, start, end, binary=True)
+        # Target CUT&RUN signal
+        target_vals = self._get_signal(self._bw_target, chrom, start, end)
 
         # Convert to torch tensors
-        sequence = torch.from_numpy(one_hot)  # (4, L)
-        additional_cutrun = torch.from_numpy(additional_vals)  # binary 0/1 (L,) or (signal_bins,)
-        target_y = torch.from_numpy(target_vals)  # binary 0/1 (L,) or (signal_bins,)
+        sequence = torch.from_numpy(one_hot)
+        k4_cutrun = torch.from_numpy(k4_vals) 
+        target_y = torch.from_numpy(target_vals)
 
-        return sequence, additional_cutrun, target_y
+        return sequence, k4_cutrun, target_y
 
 
 __all__ = [
