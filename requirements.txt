@@ -1,7 +1,15 @@
 numpy
 torch
+scipy
+tqdm
 pyfaidx
 pyBigWig
 enlighten
 matplotlib
-
+pandas
+logomaker
+biopython
+captum
+modisco-lite
+jupyter 
+ipykernel

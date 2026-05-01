@@ -57,7 +57,8 @@ class GenomicInterval:
 
 def make_uniform_intervals(
     bed: pd.DataFrame,
-    window_size: int,
+    window_left: int = 500,
+    window_right: int = 500
 ) -> List[GenomicInterval]:
     """
     Convenience function: tile a chromosome with uniform windows.
@@ -66,14 +67,12 @@ def make_uniform_intervals(
     ----------
     bed
         BED file containing genomic intervals. Assume TSS is at start 
-    window_size
-        Size of each window in bases.
     """
 
     intervals: List[GenomicInterval] = []
 
-    bed['band_start'] = bed['start'] - window_size 
-    bed['band_end'] = bed['start'] + window_size 
+    bed['band_start'] = bed['start'] - window_left
+    bed['band_end'] = bed['start'] + window_right 
     
     for chrom in bed['#chrom'].unique():
         chrom_bed = bed[bed['#chrom'] == chrom]
@@ -97,7 +96,8 @@ class GenomicDatasetBase(Dataset):
         bed_path: str,
         reference_bw_path: str,
         signal_bins: Optional[int] = None,
-        window_size: int = 1000,
+        window_left: int = 500,
+        window_right: int = 500,
         binarize_signal: bool = False,
         normalize_signal: bool = True
     ) -> None:
@@ -112,17 +112,18 @@ class GenomicDatasetBase(Dataset):
         self.signal_bins = signal_bins
         self.binarize_signal = binarize_signal
         self.normalize_signal = normalize_signal
-        self.window_size = window_size
+        self.window_left = window_left
+        self.window_right = window_right
 
         self._fasta = pyfaidx.Fasta(self.fasta_path, as_raw=True, sequence_always_upper=True)
         self._bw_ref = pyBigWig.open(reference_bw_path)
         self._bed = pd.read_csv(self.bed_path, sep="\t")
-        self._k4_scale_factor = self._get_scale_factor(self._bw_ref)
 
         # Tile chromosome windows around BED regions
         intervals = make_uniform_intervals(
             bed=self._bed,
-            window_size=window_size,
+            window_left=window_left,
+            window_right=window_right
         )
 
         # Filter out intervals where the reference signal is zero or NaN.
@@ -173,14 +174,6 @@ class GenomicDatasetBase(Dataset):
                 vals = vals / max_val
         
         return np.nan_to_num(vals, nan=0.0).astype(np.float32)
-    
-    def _get_scale_factor(self, bw):
-        max_val = 1
-        for chr in self._bed['#chrom'].unique():
-            stats = bw.stats(chrom=chr, type='max')[0]
-            if stats > max_val:
-                max_val = stats
-        return max_val
 
 
 class SequenceBigWigDataset(GenomicDatasetBase):
@@ -193,16 +186,18 @@ class SequenceBigWigDataset(GenomicDatasetBase):
         bigwig_path: str,
         bed_path: str,
         signal_bins: Optional[int] = None,
-        window_size: int = 1000,
+        window_left: int = 500,
+        window_right: int = 500,
         binarize_signal: bool = False,
-        normalize_signal: bool = True
+        normalize_signal: bool = False
     ) -> None:
         super().__init__(
             fasta_path=fasta_path,
             bed_path=bed_path,
             reference_bw_path=bigwig_path,
             signal_bins=signal_bins,
-            window_size=window_size,
+            window_left=window_left,
+            window_right=window_right,
             binarize_signal=binarize_signal,
             normalize_signal=normalize_signal
         )
@@ -246,24 +241,24 @@ class SequenceDualBigWigDataset(GenomicDatasetBase):
         target_bigwig_path: str,
         bed_path: str,
         signal_bins: Optional[int] = None,
-        window_size: int = 1000,
+        window_left: int = 500,
+        window_right: int = 500,
         binarize_signal: bool = False,
-        normalize_signal: bool = True
+        normalize_signal: bool = False
     ) -> None:
         super().__init__(
             fasta_path=fasta_path,
             bed_path=bed_path,
             reference_bw_path=target_bigwig_path,
             signal_bins=signal_bins,
-            window_size=window_size,
+            window_left=window_left,
+            window_right=window_right,
             binarize_signal=binarize_signal,
             normalize_signal=normalize_signal
         )
         self.k4_bigwig_path = k4_bigwig_path
-        self.target_bigwig_path = target_bigwig_path
         self._bw_k4 = pyBigWig.open(self.k4_bigwig_path)
         self._bw_target = self._bw_ref
-        self._k4_scale_factor = self._get_scale_factor(self._bw_k4)
 
     def __getstate__(self):
         state = super().__getstate__()
@@ -285,14 +280,14 @@ class SequenceDualBigWigDataset(GenomicDatasetBase):
         one_hot = one_hot_encode_sequence(str(seq))
 
         # k4 CUT&RUN signal (input feature)
-        k4_vals = self._get_signal(self._bw_k4, chrom, start, end) / self._k4_scale_factor
+        k4_vals = self._get_signal(self._bw_k4, chrom, start, end)
 
         # Target CUT&RUN signal
         target_vals = self._get_signal(self._bw_target, chrom, start, end)
 
         # Convert to torch tensors
         sequence = torch.from_numpy(one_hot)
-        k4_cutrun = torch.from_numpy(k4_vals) 
+        k4_cutrun = torch.log1p(torch.from_numpy(k4_vals))
         target_y = torch.from_numpy(target_vals)
 
         return sequence, k4_cutrun, target_y
