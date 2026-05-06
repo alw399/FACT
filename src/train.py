@@ -162,6 +162,7 @@ def train_cnn_regressor(
         )
         for batch_data in train_loader:
             *x_batches, y = batch_data
+            
             x_batches = [x.to(config.device) for x in x_batches]
             y = y.to(config.device)
 
@@ -183,17 +184,30 @@ def train_cnn_regressor(
         # ---- Validation ----
         model.eval()
         val_loss_sum = 0.0
+        val_counts_loss_sum = 0.0
+        val_profile_loss_sum = 0.0
         val_batches = 0
+        n_val_samples = 0
         with torch.no_grad():
             for batch_data in val_loader:
                 *x_batches, y = batch_data
                 x_batches = [x.to(config.device) for x in x_batches]
                 y = y.to(config.device)
                 profile_logits, pred_counts = model(*x_batches)
-                loss = criterion(profile_logits, pred_counts, y)
-                val_loss_sum += loss.item()
+
+                # Calculate components separately
+                c_loss = criterion.compute_counts_loss(pred_counts, y)
+                p_loss = criterion.compute_profile_loss(profile_logits, y)
+                
+                val_counts_loss_sum += c_loss.item()
+                val_profile_loss_sum += p_loss.item()
+                val_loss_sum += (c_loss + p_loss).item()
                 val_batches += 1
-        avg_val_loss = val_loss_sum / max(val_batches, 1)
+                n_val_samples += y.shape[0]
+
+        avg_val_loss = val_loss_sum / max(n_val_samples, 1)
+        avg_val_counts_loss = val_counts_loss_sum / max(n_val_samples, 1)
+        avg_val_profile_loss = val_profile_loss_sum / max(n_val_samples, 1)
         model.train()
 
         # Record history
@@ -224,7 +238,8 @@ def train_cnn_regressor(
         if epoch % 1 == 0:
             print(
                 f"Epoch {epoch + 1}/{config.epochs} "
-                f"- train loss: {avg_train_loss:.0f}, val loss: {avg_val_loss:.0f}"
+                f"- train: {avg_train_loss:.0f} | val: {avg_val_loss:.0f} "
+                f"(counts: {avg_val_counts_loss:.0f}, profile: {avg_val_profile_loss:.0f})"
             )
 
         if epochs_no_improve >= config.patience:

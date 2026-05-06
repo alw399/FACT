@@ -65,15 +65,16 @@ class ResidualConv1d(nn.Module):
         # Additive residual connection is best for DeepLIFT/MoDISco
         return x + self.relu(self.conv(x))
 
+
 class BPNetModel(nn.Module):
     def __init__(
         self, 
         seq_len: int, 
         n_channels: int = 4, 
-        hidden_channels: int = 64, 
-        n_encoder_layers: int = 9, 
+        hidden_channels: int = 128, 
+        n_encoder_layers: int = 8, 
         kernel_size: int = 3,
-        profile_kernel_size: int = 75,
+        profile_kernel_size: int = 25,
         sidelines: int = 0,
         min_profile: int = 0
     ):
@@ -216,10 +217,10 @@ class BPNetK4Model(BPNetModel):
         self,
         seq_len: int,
         n_channels: int = 5,
-        hidden_channels: int = 64,
-        n_encoder_layers: int = 9,
+        hidden_channels: int = 128,
+        n_encoder_layers: int = 8,
         kernel_size: int = 3,
-        profile_kernel_size: int = 3,
+        profile_kernel_size: int = 25,
         sidelines: int = 0,
         min_profile: int = 0
     ) -> None:
@@ -239,12 +240,13 @@ class BPNetK4Model(BPNetModel):
         if sequence_k4.dim() == 2:
             sequence_k4 = sequence_k4.unsqueeze(1)
 
+        # 1. Encoder (DNA + K4)
         x = torch.cat([sequence, sequence_k4], dim=1)  # (B, 5, L_seq)
+        h = self.encoder(x) 
 
-        h = self.encoder(x)  # (B, hidden, L_seq)
-
-        profile_logits = self.profile_head(h)  # (batch, 1, L)
-        total_counts = self.counts_head(h).squeeze(-1)
+        # 2. Heads
+        profile_logits = self.profile_head(h)  # (B, 1, L)
+        total_counts = self.counts_head(h).squeeze(-1) # (B, 1)
 
         return profile_logits, total_counts
     
@@ -294,63 +296,60 @@ class BPNetLoss(nn.Module):
         
         return smoothed.squeeze(1) if is_2d else smoothed
 
-    def forward(self, y_pred: torch.Tensor, counts_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
-        """
-        y_pred: (batch, 1, L) or (batch, L) - raw logits
-        counts_pred: (batch,) - predicted raw counts in the window
-        y_true: (batch, L) - raw signal profile
-        """
-        if y_pred.dim() == 3:
-            y_pred = y_pred.squeeze(1) # (batch, L)
-        
-        # Counts Loss
-        # target_counts is sum of all bins per sample
-        target_counts = y_true.sum(dim=-1) # (batch,)
-        pred_log_counts = counts_pred.flatten() # (batch,)
-
-        # BPNet trains the model to predict log(1 + counts) directly.
-        # target_counts are raw counts, so we log-transform them.
-        log_true_counts = torch.log1p(target_counts)
-        counts_loss = F.mse_loss(pred_log_counts, log_true_counts, reduction='none')
-
-        counts_weight = target_counts / 2
-        total_loss = (counts_weight * counts_loss).sum()
-
-        # Profile Loss
-        # filter the samples with total counts < profile_min because it's probably just noise
-        # also mask out the flanks with size of self.sidelines
-        mask = torch.ones(y_true.shape, device=y_true.device) # (batch, L)
+    def compute_counts_loss(self, counts_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """Calculates the weighted MSE counts loss."""
+        # 1. Slice sidelines to match the active region
         if self.sidelines > 0:
-            mask[:, :self.sidelines] = 0
-            mask[:, -self.sidelines:] = 0
-            
+            y_true = y_true[:, self.sidelines:-self.sidelines]
+        
+        target_counts = y_true.sum(dim=-1)
+        log_true_counts = torch.log1p(target_counts)
+        pred_log_counts = counts_pred.flatten()
+
+        # 2. Weighted MSE
+        counts_loss = F.mse_loss(pred_log_counts, log_true_counts, reduction='none')
+        counts_weight = (target_counts / 2) * 0.1
+        return (counts_weight * counts_loss).sum()
+
+    def compute_profile_loss(self, y_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """Calculates the Multinomial NLL profile loss."""
+        # 1. Slicing and Dimensions
+        if y_pred.dim() == 3:
+            y_pred = y_pred.squeeze(1)
+        if self.sidelines > 0:
+            y_true = y_true[:, self.sidelines:-self.sidelines]
+            y_pred = y_pred[:, self.sidelines:-self.sidelines]
+
+        target_counts = y_true.sum(dim=-1)
+        
+        # 2. Filter low-signal samples
         good_profiles = target_counts > self.min_profile
-        n_good = good_profiles.sum().item()
-        if n_good == 0:
-            return total_loss / y_true.shape[0]
-            
-        y_pred = y_pred[good_profiles]
-        y_true = y_true[good_profiles]
-        mask = mask[good_profiles]
+        if not good_profiles.any():
+            return torch.tensor(0.0, device=y_true.device)
 
+        y_p_good = y_pred[good_profiles]
+        y_t_good = y_true[good_profiles]
+
+        # 3. Smoothing
         if self.target_smoothing:
-            y_true = self.smooth_signal(y_true, kernel=self.smoothing_kernel)
-       
-        if self.loss_type == 'bpnet':
-            # Profile Loss: Multinomial NLL
-            # Set sideline bins to -inf so they are ignored by the softmax
-            y_pred_masked = torch.where(mask > 0.5, y_pred, torch.full_like(y_pred, -1e9))
-            pred_log_prob = F.log_softmax(y_pred_masked, dim=-1)
-            
-            # MNLL: -sum(true_counts * log_prob)
-            profile_loss = -(y_true * mask.float() * pred_log_prob).sum()
-            total_loss += profile_loss
+            y_t_good = self.smooth_signal(y_t_good, kernel=self.smoothing_kernel)
 
+        # 4. Multinomial NLL
+        if self.loss_type == 'bpnet':
+            log_probs = F.log_softmax(y_p_good, dim=-1)
+            return -(y_t_good * log_probs).sum()
         else:
             raise ValueError(f"Unknown loss_type: {self.loss_type}")
 
-        # Average by the number of samples in the batch
-        return total_loss / y_true.shape[0]
+    def forward(self, y_pred: torch.Tensor, counts_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """
+        Calculates total loss normalized by batch size.
+        """
+        batch_size = y_true.shape[0]
+        c_loss = self.compute_counts_loss(counts_pred, y_true)
+        p_loss = self.compute_profile_loss(y_pred, y_true)
+        
+        return (c_loss + p_loss) / batch_size
 
 
 

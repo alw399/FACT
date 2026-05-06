@@ -18,6 +18,7 @@ from typing import List, Optional, Sequence
 import numpy as np
 import pandas as pd 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 import pyfaidx  # for FASTA access
 import pyBigWig  # for bigWig access
@@ -43,6 +44,9 @@ def one_hot_encode_sequence(seq: str) -> np.ndarray:
         idx = NUC_TO_IDX.get(base)
         if idx is not None:
             arr[idx, i] = 1.0
+    return arr
+
+
     return arr
 
 
@@ -270,11 +274,67 @@ class SequenceDualBigWigDataset(GenomicDatasetBase):
         target_vals = self._get_signal(self._bw_target, chrom, start, end)
 
         # Convert to torch tensors
-        sequence = torch.from_numpy(one_hot)
+        sequence = torch.from_numpy(one_hot)          # (4, L)
         k4_cutrun = torch.log1p(torch.from_numpy(k4_vals))
         target_y = torch.from_numpy(target_vals)
 
         return sequence, k4_cutrun, target_y
+
+
+def get_dataset_composition(dataset: Dataset, n_samples: Optional[int] = None, only_peaks: bool = False):
+    """
+    Computes the frequency of A, C, G, T and GC content across the dataset.
+    
+    Parameters
+    ----------
+    dataset
+        The PyTorch dataset to analyze.
+    n_samples
+        Maximum number of sequences to analyze.
+    only_peaks
+        If True, only analyze sequences where the target signal (y) is > 0.
+    """
+    counts = np.zeros(4)
+    total_bases = 0
+    analyzed_count = 0
+
+    for i in range(len(dataset)):
+        if n_samples is not None and analyzed_count >= n_samples:
+            break
+            
+        item = dataset[i]
+        x = item[0] 
+        y = item[-1] # Target signal is always the last element
+
+        # Filter for peaks if requested
+        if only_peaks:
+            y_sum = y.sum() if isinstance(y, torch.Tensor) else np.sum(y)
+            if y_sum == 0:
+                continue
+
+        if isinstance(x, torch.Tensor):
+            x = x.numpy()
+        
+        counts += x.sum(axis=1)
+        total_bases += x.shape[1]
+        analyzed_count += 1
+
+    if analyzed_count == 0:
+        print("No sequences found matching the criteria.")
+        return
+
+    freqs = counts / total_bases
+    gc_content = freqs[1] + freqs[2]
+
+    print("-" * 30)
+    print(f"Nucleotide Frequencies (Analyzed {analyzed_count} sequences):")
+    print(f"  A: {freqs[0]:.2%}")
+    print(f"  C: {freqs[1]:.2%}")
+    print(f"  G: {freqs[2]:.2%}")
+    print(f"  T: {freqs[3]:.2%}")
+    print("-" * 30)
+    print(f"  GC Content: {gc_content:.2%}")
+    print("-" * 30)
 
 
 __all__ = [
@@ -283,5 +343,6 @@ __all__ = [
     "SequenceBigWigDataset",
     "SequenceDualBigWigDataset",
     "make_uniform_intervals",
+    "get_dataset_composition"
 ]
 
