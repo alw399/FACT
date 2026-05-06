@@ -19,161 +19,119 @@ from torch import nn
 import torch.nn.functional as F
 
 
+def compute_receptive_field(model: nn.Module, seq_len: int) -> tuple:
+    """
+    Compute the effective receptive field of a convolutional model.
+
+    Args:
+        model: PyTorch convolutional model
+        seq_len: Input sequence length
+
+    Returns:
+        Tuple of (receptive_field, padding)
+    """
+    rf = 1
+    pad = 0
+    
+    # Use .modules() to recursively find all layers
+    for layer in model.modules():
+        if isinstance(layer, nn.Conv1d):
+            k = layer.kernel_size[0] if isinstance(layer.kernel_size, tuple) else layer.kernel_size
+            d = layer.dilation[0] if isinstance(layer.dilation, tuple) else layer.dilation
+            rf = rf + (k - 1) * d
+            pad = pad + (k - 1) * d // 2
+        elif isinstance(layer, nn.MaxPool1d):
+            k = layer.kernel_size[0] if isinstance(layer.kernel_size, tuple) else layer.kernel_size
+            rf = rf + (k - 1)
+            pad = pad + (k - 1) // 2
+
+    if seq_len < rf:
+        print(f"WARNING: Sequence length ({seq_len}) < receptive field ({rf}). Edge effects may dominate.")
+    else:
+        print(f"Receptive field: {rf} bp (Sequence length: {seq_len} bp)")
+
+    return rf, pad
+
+
 class ResidualConv1d(nn.Module):
-    """Residual block with dilated 1D convolution."""
-    def __init__(self, channels: int, kernel_size: int, dilation: int):
+    def __init__(self, channels, kernel_size, dilation):
         super().__init__()
         padding = (kernel_size - 1) * dilation // 2
-        self.conv = nn.Conv1d(
-            in_channels=channels,
-            out_channels=channels,
-            kernel_size=kernel_size,
-            dilation=dilation,
-            padding=padding,
-        )
-        self.bn = nn.BatchNorm1d(channels)
+        self.conv = nn.Conv1d(channels, channels, kernel_size, 
+                              dilation=dilation, padding=padding)
         self.relu = nn.ReLU()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        res = self.conv(x)
-        res = self.bn(res)
-        res = self.relu(res)
-        return x + res
-
+    def forward(self, x):
+        # Additive residual connection is best for DeepLIFT/MoDISco
+        return x + self.relu(self.conv(x))
 
 class BPNetModel(nn.Module):
-    """
-    BPNet-style architecture for CUT&RUN prediction.
-    
-    Architecture:
-    - Encoder: Dilated convolutional stack (exponentially increasing dilation)
-    - Profile Head: Predicts binary binding profile (batch, 1, L)
-    
-    Input:  (batch, 4, L) - one-hot encoded DNA
-    Output: profile_logits of shape (batch, 1, L) - logits for binary classification
-    """
-
     def __init__(
-        self,
-        seq_len: int,
-        n_channels: int = 4,
-        hidden_channels: int = 64,
-        n_encoder_layers: int = 9,
-        kernel_size: int = 25,
+        self, 
+        seq_len: int, 
+        n_channels: int = 4, 
+        hidden_channels: int = 64, 
+        n_encoder_layers: int = 9, 
+        kernel_size: int = 3,
         profile_kernel_size: int = 75,
-        output_len: Optional[int] = None,
-    ) -> None:
-        """
-        Parameters
-        ----------
-        seq_len
-            Input sequence length.
-        n_channels
-            Input channels (4 for one-hot DNA: A, C, G, T).
-        hidden_channels
-            Number of filters in encoder layers (default 64, matching BPNet).
-        n_encoder_layers
-            Number of dilated conv layers in encoder (default 9, matching BPNet).
-        kernel_size
-            Kernel size for encoder layers (default 25, matching BPNet).
-        profile_kernel_size
-            Kernel size for profile head (default 75, matching BPNet).
-        output_len
-            Output profile length. If None, uses seq_len.
-        """
+        sidelines: int = 0,
+        min_profile: int = 0
+    ):
         super().__init__()
-
         self.seq_len = seq_len
         self.n_channels = n_channels
         self.hidden_channels = hidden_channels
         self.n_encoder_layers = n_encoder_layers
         self.kernel_size = kernel_size
         self.profile_kernel_size = profile_kernel_size
-
-        if output_len is None:
-            output_len = seq_len
-        self.output_len = output_len
+        self.sidelines = sidelines
+        self.min_profile = min_profile
         
-
-        # --- Encoder: Dilated Convolutional Stack ---
-        # Exponentially increasing dilation: 1, 2, 4, 8, 16, 32, 64, 128, 256
-        encoder_layers = []
-        in_ch = n_channels
-        
-        for i in range(n_encoder_layers):
-            dilation = 2 ** i  # 1, 2, 4, 8, 16, 32, 64, 128, 256, ...
-            padding = (kernel_size - 1) * dilation // 2  # "same" padding for dilated conv
-            
-            if in_ch != hidden_channels:
-                conv = nn.Conv1d(
-                    in_channels=in_ch,
-                    out_channels=hidden_channels,
-                    kernel_size=kernel_size,
-                    dilation=dilation,
-                    padding=padding,
-                )
-                encoder_layers.append(conv)
-                encoder_layers.append(nn.BatchNorm1d(hidden_channels))
-                encoder_layers.append(nn.ReLU())
-            else:
-                encoder_layers.append(ResidualConv1d(hidden_channels, kernel_size, dilation))
-                
-            in_ch = hidden_channels
-        
-        self.encoder = nn.Sequential(*encoder_layers)
-
-        # --- Profile Head: Predicts WHERE binding occurs ---
-        profile_padding = (profile_kernel_size - 1) // 2
-        self.profile_head = nn.Conv1d(
-            in_channels=hidden_channels,
-            out_channels=1, 
-            kernel_size=profile_kernel_size,
-            padding=profile_padding,
-        )
-
-        kernel_size=51
+        # 1. Initial Conv Layer
         padding = (kernel_size - 1) // 2
-        self.mlp = nn.Sequential(
-            nn.LeakyReLU(0.1),
-            nn.AdaptiveAvgPool1d(output_len),
-            nn.AvgPool1d(kernel_size=kernel_size, stride=1, padding=padding, count_include_pad=False)
+        stem = nn.Sequential(
+            nn.Conv1d(n_channels, hidden_channels, kernel_size, padding=padding),
+            nn.ReLU()
         )
 
-        # --- Count Head: Predicts total read counts ---
+        # 2. Dilated Residual Body
+        body = nn.Sequential(*[
+            ResidualConv1d(hidden_channels, kernel_size, dilation=2**i)
+            for i in range(1, n_encoder_layers)
+        ])
+        
+        self.encoder = nn.Sequential(stem, body)
 
+        # 3. Profile Head: High-resolution output (Batch, 1, SeqLen)
+        self.profile_head = nn.Conv1d(
+            hidden_channels, 1, kernel_size=profile_kernel_size, padding=(profile_kernel_size - 1) // 2
+        )
+
+        # 4. Count Head: Scalar output (Batch, 1)
         self.counts_head = nn.Sequential(
             nn.AdaptiveAvgPool1d(1),
             nn.Flatten(),
             nn.Linear(hidden_channels, 1)
         )
 
+        self._init_weights()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        x
-            Tensor of shape (batch, 4, L).
+    def _init_weights(self):
+        """Kaiming initialization for convolutional and linear layers."""
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d) or isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
-        Return
-        -------
-        profile_logits
-            Tensor of shape (batch, 1, L_out). Predicted binding profile
-        total_counts
-            Tensor of shape (batch,). Predicted log(1+counts) in the window
-        """
-        # Encoder
-        h = self.encoder(x)  # (batch, hidden_channels, L)
+    def forward(self, x):
+        h = self.encoder(x)
         
-        # Profile
-        profile_logits = self.profile_head(h)  # (batch, 1, L)
-        profile_logits = self.mlp(profile_logits) # (batch, 1, L_out)
+        profile_logits = self.profile_head(h)
+        count_logits = self.counts_head(h)
 
-        # Counts 
-        total_counts = self.counts_head(h).squeeze(-1)
-
-        return profile_logits, total_counts
-    
+        return profile_logits, count_logits
+        
 
     def save_model(self, path: Union[str, "os.PathLike[str]"]) -> None:
         """
@@ -198,7 +156,8 @@ class BPNetModel(nn.Module):
             "n_encoder_layers": model.n_encoder_layers,
             "kernel_size": model.kernel_size,
             "profile_kernel_size": model.profile_kernel_size,
-            "output_len": model.output_len,
+            "sidelines": getattr(model, "sidelines", 0),
+            "min_profile": getattr(model, "min_profile", 0),
         }
         checkpoint = {
             "model_class": class_name,
@@ -244,24 +203,25 @@ class BPNetK4Model(BPNetModel):
 
     Inputs:
       - sequence: (batch, 4, L_seq)
-      - additional_y: (batch, L_sig) or (batch, 1, L_sig)
+      - sequence_k4: (batch, 1, L_seq)
 
-    The additional signal is interpolated to L_seq if needed, then concatenated
-    to the sequence channels => (batch, 5, L_seq).
+    The additional signal is concatenated to the sequence channels => (batch, 5, L_seq).
 
     Outputs:
-      - profile_logits: (batch, 1, L_out) - logits for binary classification
+      - profile_logits: (batch, 1, L_seq)
+      - total_counts: (batch, 1)
     """
 
     def __init__(
         self,
         seq_len: int,
-        output_len: int,
         n_channels: int = 5,
         hidden_channels: int = 64,
         n_encoder_layers: int = 9,
-        kernel_size: int = 25,
-        profile_kernel_size: int = 75,
+        kernel_size: int = 3,
+        profile_kernel_size: int = 3,
+        sidelines: int = 0,
+        min_profile: int = 0
     ) -> None:
         super().__init__(
             seq_len=seq_len,
@@ -270,11 +230,12 @@ class BPNetK4Model(BPNetModel):
             n_encoder_layers=n_encoder_layers,
             kernel_size=kernel_size,
             profile_kernel_size=profile_kernel_size,
-            output_len=output_len,
+            sidelines=sidelines,
+            min_profile=min_profile
         )
 
     def forward(self, sequence: torch.Tensor, sequence_k4: torch.Tensor) -> torch.Tensor:
-        # Ensure additional has shape (B, 1, L_sig)
+        # Ensure sequence_k4 has shape (B, 1, L_sig)
         if sequence_k4.dim() == 2:
             sequence_k4 = sequence_k4.unsqueeze(1)
 
@@ -283,74 +244,102 @@ class BPNetK4Model(BPNetModel):
         h = self.encoder(x)  # (B, hidden, L_seq)
 
         profile_logits = self.profile_head(h)  # (batch, 1, L)
-        profile_logits = self.mlp(profile_logits) # (batch, 1, L_out)
         total_counts = self.counts_head(h).squeeze(-1)
 
         return profile_logits, total_counts
     
 
 class BPNetLoss(nn.Module):
-    def __init__(self, loss_type: str = 'bpnet', counts_weight: float = 1e2, min_profile=0):
+    def __init__(self, loss_type: str = 'bpnet', min_profile=0, sidelines=0, target_smoothing=False, smoothing_sigma=3.0):
         super().__init__()
         self.loss_type = loss_type
-        self.counts_weight = counts_weight
         self.counts_loss = nn.MSELoss(reduction='sum')
         self.min_profile = min_profile
+        self.sidelines = sidelines
+        self.target_smoothing = target_smoothing
+        self.smoothing_sigma = smoothing_sigma
+
+        if self.target_smoothing:
+            kernel = self.get_gaussian_kernel(self.smoothing_sigma)
+            self.register_buffer('smoothing_kernel', kernel)
+            self.smoothing_padding = kernel.shape[-1] // 2
+
+    @staticmethod
+    def get_gaussian_kernel(sigma: float) -> torch.Tensor:
+        """Creates a 1D Gaussian kernel as a 3D tensor (1, 1, K)."""
+        kernel_size = int(6 * sigma + 1)
+        if kernel_size % 2 == 0: kernel_size += 1
+        x = torch.arange(kernel_size).float()
+        center = kernel_size // 2
+        kernel = torch.exp(-0.5 * ((x - center) / sigma)**2)
+        kernel = kernel / kernel.sum()
+        return kernel.view(1, 1, -1)
+
+    @staticmethod
+    def smooth_signal(signal: torch.Tensor, sigma: float = None, kernel: torch.Tensor = None) -> torch.Tensor:
+        """Applies Gaussian smoothing to a 1D signal (B, L) or (B, 1, L)."""
+        if kernel is None:
+            if sigma is None:
+                raise ValueError("Either sigma or kernel must be provided for smoothing.")
+            kernel = BPNetLoss.get_gaussian_kernel(sigma).to(signal.device)
+        
+        # Determine if we need to add a channel dimension
+        # (Batch, Length) -> (Batch, 1, Length)
+        is_2d = (signal.dim() == 2)
+        if is_2d:
+            signal = signal.unsqueeze(1)
+            
+        pad = kernel.shape[-1] // 2
+        smoothed = F.conv1d(signal, kernel, padding=pad)
+        
+        return smoothed.squeeze(1) if is_2d else smoothed
 
     def forward(self, y_pred: torch.Tensor, counts_pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
         """
-        y_pred: (batch, 1, output_len) or (batch, output_len) - raw logits
+        y_pred: (batch, 1, L) or (batch, L) - raw logits
         counts_pred: (batch,) - predicted raw counts in the window
-        y_true: (batch, output_len) - raw signal profile (may contain -1 for missing)
+        y_true: (batch, L) - raw signal profile
         """
         if y_pred.dim() == 3:
-            y_pred = y_pred.squeeze(1) # (batch, output_len)
+            y_pred = y_pred.squeeze(1) # (batch, L)
         
-        # 1. Create global mask for valid bins
-        mask = (y_true != -1) # (batch, output_len)
-        valid_samples = mask.any(dim=1) # (batch,)
-        
-        if not valid_samples.any():
-            return torch.tensor(0.0, device=y_pred.device, requires_grad=True)
-
-        # 2. Counts Loss
-        # target_counts is sum of valid bins only per sample
-        target_counts = (y_true * mask.float()).sum(dim=-1) # (batch,)
-        pred_log_counts = (counts_pred).flatten() # (batch,)
+        # Counts Loss
+        # target_counts is sum of all bins per sample
+        target_counts = y_true.sum(dim=-1) # (batch,)
+        pred_log_counts = counts_pred.flatten() # (batch,)
 
         # BPNet trains the model to predict log(1 + counts) directly.
         # target_counts are raw counts, so we log-transform them.
-        log_true_counts = torch.log1p(target_counts[valid_samples])
-        counts_loss = F.mse_loss(pred_log_counts[valid_samples], log_true_counts, reduction='sum')
+        log_true_counts = torch.log1p(target_counts)
+        counts_loss = F.mse_loss(pred_log_counts, log_true_counts, reduction='none')
 
-        total_loss = self.counts_weight * counts_loss
+        counts_weight = target_counts / 2
+        total_loss = (counts_weight * counts_loss).sum()
 
-        # 3. Profile Loss
+        # Profile Loss
         # filter the samples with total counts < profile_min because it's probably just noise
+        # also mask out the flanks with size of self.sidelines
+        mask = torch.ones(y_true.shape, device=y_true.device) # (batch, L)
+        if self.sidelines > 0:
+            mask[:, :self.sidelines] = 0
+            mask[:, -self.sidelines:] = 0
+            
         good_profiles = target_counts > self.min_profile
+        n_good = good_profiles.sum().item()
+        if n_good == 0:
+            return total_loss / y_true.shape[0]
+            
         y_pred = y_pred[good_profiles]
         y_true = y_true[good_profiles]
         mask = mask[good_profiles]
-        
-        if self.loss_type == 'kldiv':
-            # target_prob: normalize valid bins to sum to 1 per sample
-            target_sum = target_counts[good_profiles].unsqueeze(-1) + 1e-8
-            target_prob = (y_true * mask.float()) / target_sum
-            
-            # pred_log_prob: masked log_softmax
-            # Set invalid bins to -inf so they don't contribute to the softmax denominator
-            y_pred_masked = torch.where(mask, y_pred, torch.full_like(y_pred, -1e9))
-            pred_log_prob = F.log_softmax(y_pred_masked, dim=-1)
-            
-            # KL divergence calculation: target * (log(target) - pred_log_prob)
-            kl_div = target_prob * (torch.log(target_prob + 1e-8) - pred_log_prob)
-            # Sum up valid contributions
-            total_loss += (kl_div * mask.float()).sum()
-            
-        elif self.loss_type == 'bpnet':
+
+        if self.target_smoothing:
+            y_true = self.smooth_signal(y_true, kernel=self.smoothing_kernel)
+       
+        if self.loss_type == 'bpnet':
             # Profile Loss: Multinomial NLL
-            # Set invalid bins to -inf for log_softmax
-            y_pred_masked = torch.where(mask, y_pred, torch.full_like(y_pred, -1e9))
+            # Set sideline bins to -inf so they are ignored by the softmax
+            y_pred_masked = torch.where(mask > 0.5, y_pred, torch.full_like(y_pred, -1e9))
             pred_log_prob = F.log_softmax(y_pred_masked, dim=-1)
             
             # MNLL: -sum(true_counts * log_prob)
@@ -360,8 +349,8 @@ class BPNetLoss(nn.Module):
         else:
             raise ValueError(f"Unknown loss_type: {self.loss_type}")
 
-        # Average by the number of samples that had at least one valid bin
-        return total_loss / valid_samples.float().sum()
+        # Average by the number of samples in the batch
+        return total_loss / y_true.shape[0]
 
 
 

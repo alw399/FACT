@@ -58,7 +58,8 @@ class GenomicInterval:
 def make_uniform_intervals(
     bed: pd.DataFrame,
     window_left: int = 500,
-    window_right: int = 500
+    window_right: int = 500,
+    exclude_kws=['random']
 ) -> List[GenomicInterval]:
     """
     Convenience function: tile a chromosome with uniform windows.
@@ -75,6 +76,8 @@ def make_uniform_intervals(
     bed['band_end'] = bed['start'] + window_right 
     
     for chrom in bed['#chrom'].unique():
+        if any(kw in chrom for kw in exclude_kws):
+            continue
         chrom_bed = bed[bed['#chrom'] == chrom]
         intervals.extend([
             GenomicInterval(chrom=chrom, start=start, end=end) 
@@ -97,9 +100,7 @@ class GenomicDatasetBase(Dataset):
         reference_bw_path: str,
         signal_bins: Optional[int] = None,
         window_left: int = 500,
-        window_right: int = 500,
-        binarize_signal: bool = False,
-        normalize_signal: bool = True
+        window_right: int = 500
     ) -> None:
         if pyfaidx is None:
             raise ImportError("pyfaidx is required for GenomicDatasetBase")
@@ -110,8 +111,6 @@ class GenomicDatasetBase(Dataset):
         self.bed_path = bed_path
         self.reference_bw_path = reference_bw_path
         self.signal_bins = signal_bins
-        self.binarize_signal = binarize_signal
-        self.normalize_signal = normalize_signal
         self.window_left = window_left
         self.window_right = window_right
 
@@ -166,13 +165,6 @@ class GenomicDatasetBase(Dataset):
         
         vals = np.nan_to_num(vals, nan=0.0).astype(np.float32)
 
-        if self.binarize_signal:
-            vals = (vals > 0).astype(np.float32)
-        elif self.normalize_signal:
-            max_val = np.nanmax(vals)
-            if max_val > 0:
-                vals = vals / max_val
-        
         return np.nan_to_num(vals, nan=0.0).astype(np.float32)
 
 
@@ -187,9 +179,7 @@ class SequenceBigWigDataset(GenomicDatasetBase):
         bed_path: str,
         signal_bins: Optional[int] = None,
         window_left: int = 500,
-        window_right: int = 500,
-        binarize_signal: bool = False,
-        normalize_signal: bool = False
+        window_right: int = 500
     ) -> None:
         super().__init__(
             fasta_path=fasta_path,
@@ -197,9 +187,7 @@ class SequenceBigWigDataset(GenomicDatasetBase):
             reference_bw_path=bigwig_path,
             signal_bins=signal_bins,
             window_left=window_left,
-            window_right=window_right,
-            binarize_signal=binarize_signal,
-            normalize_signal=normalize_signal
+            window_right=window_right
         )
         self.bigwig_path = bigwig_path
         self._bw = self._bw_ref
@@ -242,9 +230,7 @@ class SequenceDualBigWigDataset(GenomicDatasetBase):
         bed_path: str,
         signal_bins: Optional[int] = None,
         window_left: int = 500,
-        window_right: int = 500,
-        binarize_signal: bool = False,
-        normalize_signal: bool = False
+        window_right: int = 500
     ) -> None:
         super().__init__(
             fasta_path=fasta_path,
@@ -252,9 +238,7 @@ class SequenceDualBigWigDataset(GenomicDatasetBase):
             reference_bw_path=target_bigwig_path,
             signal_bins=signal_bins,
             window_left=window_left,
-            window_right=window_right,
-            binarize_signal=binarize_signal,
-            normalize_signal=normalize_signal
+            window_right=window_right
         )
         self.k4_bigwig_path = k4_bigwig_path
         self._bw_k4 = pyBigWig.open(self.k4_bigwig_path)

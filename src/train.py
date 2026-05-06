@@ -6,8 +6,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split, TensorDataset
+import torch.optim as optim
 
-from cnn import BPNetModel, BPNetK4Model, BPNetLoss
+from cnn import BPNetModel, BPNetK4Model, BPNetLoss, compute_receptive_field
 from datas import SequenceBigWigDataset, SequenceDualBigWigDataset
 
 from tqdm.auto import tqdm
@@ -24,8 +25,11 @@ class TrainConfig:
     weight_decay: float = 1e-6
     epochs: int = 10
     patience: int = 5
-    loss_type: str = 'bpnet',
-    min_profile: int = 6000,
+    loss_type: str = 'bpnet'
+    min_profile: int = 0
+    sidelines: int = 0
+    target_smoothing: bool = False
+    smoothing_sigma: float = 3.0
     device: str = (
         "mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
         else "cuda" if torch.cuda.is_available()
@@ -99,16 +103,17 @@ def train_cnn_regressor(
     # Peek at one batch to infer sequence and target lengths
     *x0, y0 = next(iter(train_loader))
     seq_len = x0[0].shape[-1]
-    output_len = y0.shape[-1]
 
     # Initialize model
     if isinstance(dataset, SequenceBigWigDataset):
-        model = BPNetModel(seq_len=seq_len, n_channels=4, output_len=output_len)
+        model = BPNetModel(seq_len=seq_len, n_channels=4, sidelines=config.sidelines, min_profile=config.min_profile)
     elif isinstance(dataset, SequenceDualBigWigDataset):
-        model = BPNetK4Model(seq_len=seq_len, n_channels=5, output_len=output_len)
+        model = BPNetK4Model(seq_len=seq_len, n_channels=5, sidelines=config.sidelines, min_profile=config.min_profile)
     else:
         raise ValueError(f"Dataset type {type(dataset)} not supported")
     model.to(config.device)
+
+    compute_receptive_field(model, seq_len)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -118,8 +123,12 @@ def train_cnn_regressor(
 
     criterion = BPNetLoss(
         loss_type=config.loss_type, 
-        min_profile=config.min_profile
+        min_profile=config.min_profile,
+        sidelines=config.sidelines,
+        target_smoothing=config.target_smoothing,
+        smoothing_sigma=config.smoothing_sigma,
     )
+    criterion.to(config.device)
 
     # Expose loaders and datasets on the model so that downstream
     # notebooks can reuse the exact same splits and sampling logic.
@@ -129,7 +138,6 @@ def train_cnn_regressor(
     model.train_loader = train_loader
     model.val_loader = val_loader
     model.test_loader = test_loader
-    model.min_profile = config.min_profile # save so we can keep track later
 
     # Track losses for all epochs
     train_losses = []
@@ -276,6 +284,10 @@ def visualize_split_predictions(
     n_cols: int = 1,
     loader: Optional[DataLoader] = None,
     save_path: Optional[str] = None,
+    smooth_pred: bool = False,
+    smooth_sigma: float = 3.0,
+    smooth_true: bool = False,
+    smooth_sigma_true: float = 3.0,
 ) -> None:
     """
     Visualize model predictions vs true signal for a few examples from
@@ -340,10 +352,21 @@ def visualize_split_predictions(
                     y_pred = F.softmax(profile_logits.squeeze(), dim=-1)
                     y_true_norm = y_true_single / (y_true_single.sum() + 1e-8)
 
+                    if smooth_pred:
+                        y_pred = BPNetLoss.smooth_signal(y_pred.view(1, -1), sigma=smooth_sigma).squeeze()
+
+                    if smooth_true:
+                        y_true_norm = BPNetLoss.smooth_signal(y_true_norm.view(1, -1), sigma=smooth_sigma_true).squeeze()
+
                     row, col = divmod(count, n_cols_actual)
                     ax = axes[row, col]
                     ax.plot(y_true_norm.cpu().numpy(), label="true", alpha=0.7)
                     ax.plot(y_pred.cpu().numpy(), label="pred", alpha=0.7)
+                    
+                    sidelines = getattr(model, "sidelines", 0)
+                    if sidelines > 0:
+                        ax.axvline(x=sidelines, color='k', linestyle='--', alpha=0.5)
+                        ax.axvline(x=len(y_true_norm) - sidelines, color='k', linestyle='--', alpha=0.5)
                     
                     true_total = y_true_single.sum().item()
                     # The model outputs log(1 + counts), so we invert it for the visualization
@@ -369,7 +392,9 @@ def visualize_split_predictions(
             plt.show()
 
 @torch.no_grad()
-def evaluate_model_metrics(model, loader, device="cpu", min_profile=0):
+def evaluate_model_metrics(model, loader, device="cpu", min_profile=0, 
+        smooth_pred=False, smooth_sigma=3.0, smooth_true=False, smooth_sigma_true=3.0):
+    
     model.eval()
     model.to(device)
     all_true_log_counts, all_pred_log_counts, all_jsds = [], [], []
@@ -382,15 +407,22 @@ def evaluate_model_metrics(model, loader, device="cpu", min_profile=0):
 
             profile_logits, pred_counts = model(*x_batches)
 
-            mask = (y_true_batch != -1)
-            target_counts = (y_true_batch * mask.float()).sum(dim=-1)
+            target_counts = y_true_batch.sum(dim=-1)
 
             all_pred_log_counts.extend(pred_counts.squeeze(-1).cpu().numpy().tolist())
             all_true_log_counts.extend(torch.log1p(target_counts).cpu().numpy().tolist())
 
-            y_pred_masked = torch.where(mask, profile_logits.squeeze(1), torch.full_like(profile_logits.squeeze(1), -1e9))
-            y_pred_prob = F.softmax(y_pred_masked, dim=-1).cpu().numpy()
-            y_true_prob = ((y_true_batch * mask.float()) / (target_counts.unsqueeze(-1) + 1e-8)).cpu().numpy()
+            y_pred_prob = F.softmax(profile_logits.squeeze(1), dim=-1).cpu()
+            y_true_prob = (y_true_batch / (target_counts.unsqueeze(-1) + 1e-8)).cpu()
+
+            if smooth_pred:
+                y_pred_prob = BPNetLoss.smooth_signal(y_pred_prob.to(device), sigma=smooth_sigma).cpu()
+
+            if smooth_true:
+                y_true_prob = BPNetLoss.smooth_signal(y_true_prob.to(device), sigma=smooth_sigma_true).cpu()
+            
+            y_pred_prob = y_pred_prob.numpy()
+            y_true_prob = y_true_prob.numpy()
 
             for i in range(y_pred_prob.shape[0]):
                 if target_counts[i].item() > min_profile:
