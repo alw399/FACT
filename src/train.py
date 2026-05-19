@@ -8,8 +8,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split, TensorDataset
 import torch.optim as optim
 
-from cnn import BPNetModel, BPNetK4Model, BPNetLoss, compute_receptive_field
-from datas import SequenceBigWigDataset, SequenceDualBigWigDataset
+from cnn import BPNetModel, BPNetK4Model, BPNetClusterModel, BPNetLoss, ClassifierLoss, compute_receptive_field
+from datas import SequenceBigWigDataset, SequenceDualBigWigDataset, SequenceBigWigPeaksDataset, SequenceBigWigClusterDataset
 
 from tqdm.auto import tqdm
 import enlighten
@@ -30,11 +30,57 @@ class TrainConfig:
     sidelines: int = 0
     target_smoothing: bool = False
     smoothing_sigma: float = 3.0
+    rc_augment: bool = False
     device: str = (
         "mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
         else "cuda" if torch.cuda.is_available()
         else "cpu"
     )
+
+def create_loaders(dataset, train_frac, val_frac, test_frac, batch_size, num_workers, split_seed, rc_augment):
+    # --- Split into train/val/test ---
+    if not (0.0 < train_frac <= 1.0 and 0.0 <= val_frac <= 1.0 and 0.0 <= test_frac <= 1.0):
+        raise ValueError("train_frac, val_frac, and test_frac must be between 0 and 1.")
+    frac_sum = train_frac + val_frac + test_frac
+    train_frac /= frac_sum
+    val_frac /= frac_sum
+    test_frac /= frac_sum
+
+    n = len(dataset)
+    train_size = int(train_frac * n)
+    val_size = int(val_frac * n)
+    test_size = n - train_size - val_size
+    if train_size == 0 or val_size == 0 or test_size == 0:
+        raise ValueError("Dataset too small for requested train/val/test split.")
+
+    g = torch.Generator()
+    g.manual_seed(split_seed)
+    train_ds, val_ds, test_ds = random_split(dataset, [train_size, val_size, test_size], generator=g)
+    
+    train_ds.rc_augment = rc_augment
+    val_ds.rc_augment = False
+    test_ds.rc_augment = False
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,  # shuffles order every epoch
+        num_workers=num_workers,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+    )
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+    )
+
+    return train_loader, val_loader, test_loader
 
 def train_cnn_regressor(
     dataset: SequenceBigWigDataset,
@@ -62,56 +108,33 @@ def train_cnn_regressor(
     if config is None:
         config = TrainConfig()
 
-    # --- Split into train/val/test ---
-    if not (0.0 < train_frac <= 1.0 and 0.0 <= val_frac <= 1.0 and 0.0 <= test_frac <= 1.0):
-        raise ValueError("train_frac, val_frac, and test_frac must be between 0 and 1.")
-    frac_sum = train_frac + val_frac + test_frac
-    train_frac /= frac_sum
-    val_frac /= frac_sum
-    test_frac /= frac_sum
-
-    n = len(dataset)
-    train_size = int(train_frac * n)
-    val_size = int(val_frac * n)
-    test_size = n - train_size - val_size
-    if train_size == 0 or val_size == 0 or test_size == 0:
-        raise ValueError("Dataset too small for requested train/val/test split.")
-
-    g = torch.Generator()
-    g.manual_seed(split_seed)
-    train_ds, val_ds, test_ds = random_split(dataset, [train_size, val_size, test_size], generator=g)
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=batch_size,
-        shuffle=True,  # shuffles order every epoch
-        num_workers=num_workers,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-    )
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-    )
+    train_loader, val_loader, test_loader = create_loaders(
+        dataset, 
+        train_frac, 
+        val_frac, 
+        test_frac, 
+        batch_size, 
+        num_workers, 
+        split_seed, 
+        config.rc_augment)
 
     # Peek at one batch to infer sequence and target lengths
     *x0, y0 = next(iter(train_loader))
     seq_len = x0[0].shape[-1]
 
     # Initialize model
-    if isinstance(dataset, SequenceBigWigDataset):
-        model = BPNetModel(seq_len=seq_len, n_channels=4, sidelines=config.sidelines, min_profile=config.min_profile)
+    if isinstance(dataset, SequenceBigWigClusterDataset):
+        model = BPNetClusterModel(seq_len=seq_len, n_channels=4, sidelines=config.sidelines, min_profile=config.min_profile)
     elif isinstance(dataset, SequenceDualBigWigDataset):
         model = BPNetK4Model(seq_len=seq_len, n_channels=5, sidelines=config.sidelines, min_profile=config.min_profile)
+    elif isinstance(dataset, SequenceBigWigDataset):
+        model = BPNetModel(seq_len=seq_len, n_channels=4, sidelines=config.sidelines, min_profile=config.min_profile)
+    elif isinstance(dataset, SequenceBigWigPeaksDataset):
+        model = BPNetModel(seq_len=seq_len, n_channels=4, sidelines=config.sidelines, min_profile=config.min_profile)
     else:
         raise ValueError(f"Dataset type {type(dataset)} not supported")
     model.to(config.device)
+
 
     compute_receptive_field(model, seq_len)
 
@@ -121,20 +144,21 @@ def train_cnn_regressor(
         weight_decay=config.weight_decay,
     )
 
-    criterion = BPNetLoss(
-        loss_type=config.loss_type, 
-        min_profile=config.min_profile,
-        sidelines=config.sidelines,
-        target_smoothing=config.target_smoothing,
-        smoothing_sigma=config.smoothing_sigma,
-    )
+    if isinstance(dataset, SequenceBigWigClusterDataset):
+        criterion = ClassifierLoss(min_profile=config.min_profile, sidelines=config.sidelines, target_smoothing=config.target_smoothing, smoothing_sigma=config.smoothing_sigma)
+    else:
+        criterion = BPNetLoss(
+            loss_type=config.loss_type, 
+            min_profile=config.min_profile,
+            sidelines=config.sidelines,
+            target_smoothing=config.target_smoothing,
+            smoothing_sigma=config.smoothing_sigma,
+        )
+
     criterion.to(config.device)
 
     # Expose loaders and datasets on the model so that downstream
     # notebooks can reuse the exact same splits and sampling logic.
-    model.train_dataset = train_ds
-    model.val_dataset = val_ds
-    model.test_dataset = test_ds
     model.train_loader = train_loader
     model.val_loader = val_loader
     model.test_loader = test_loader
@@ -161,15 +185,51 @@ def train_cnn_regressor(
             leave=False,
         )
         for batch_data in train_loader:
-            *x_batches, y = batch_data
+            if isinstance(dataset, SequenceBigWigClusterDataset):
+                one_hot, label, signal = batch_data
+                x_batches = [one_hot]
+                y_true = signal
+                label_true = label.float().unsqueeze(1).to(config.device)
+            elif isinstance(dataset, SequenceDualBigWigDataset):
+                sequence, k4_cutrun, target_y = batch_data
+                x_batches = [sequence, k4_cutrun]
+                y_true = target_y
+            else:
+                one_hot, signal = batch_data
+                x_batches = [one_hot]
+                y_true = signal
             
+            # --- RC Augmentation ---
+            if config.rc_augment:
+                flip_mask = torch.rand(x_batches[0].shape[0], device=x_batches[0].device) < 0.5
+                if flip_mask.any():
+                    # DNA: swap A/T (0/3) and C/G (1/2), then flip the length axis
+                    flipped = x_batches[0][flip_mask][:, [3, 2, 1, 0], :].flip(dims=[-1])
+                    x_batches[0] = x_batches[0].clone()
+                    x_batches[0][flip_mask] = flipped
+
+                    # Auxiliary tracks: flip length axis only (whatever rank they are)
+                    for i in range(1, len(x_batches)):
+                        flipped_aux = x_batches[i][flip_mask].flip(dims=[-1])
+                        x_batches[i] = x_batches[i].clone()
+                        x_batches[i][flip_mask] = flipped_aux
+
+                    # Target profile: flip length axis
+                    flipped_y = y_true[flip_mask].flip(dims=[-1])
+                    y_true = y_true.clone()
+                    y_true[flip_mask] = flipped_y
+
             x_batches = [x.to(config.device) for x in x_batches]
-            y = y.to(config.device)
+            y_true = y_true.to(config.device)
 
             optimizer.zero_grad()
-            profile_logits, pred_counts = model(*x_batches)  # (batch, 1, L)
+            profile_logits, pred_outputs = model(*x_batches)
 
-            loss = criterion(profile_logits, pred_counts, y)
+            if isinstance(dataset, SequenceBigWigClusterDataset):
+                loss = criterion(profile_logits, pred_outputs, y_true, label_true)
+            else:
+                loss = criterion(profile_logits, pred_outputs, y_true)
+            
             loss.backward()
             optimizer.step()
 
@@ -190,20 +250,38 @@ def train_cnn_regressor(
         n_val_samples = 0
         with torch.no_grad():
             for batch_data in val_loader:
-                *x_batches, y = batch_data
+                if isinstance(dataset, SequenceBigWigClusterDataset):
+                    one_hot, label, signal = batch_data
+                    x_batches = [one_hot]
+                    y_true = signal
+                    label_true = label.float().unsqueeze(1).to(config.device)
+                elif isinstance(dataset, SequenceDualBigWigDataset):
+                    sequence, k4_cutrun, target_y = batch_data
+                    x_batches = [sequence, k4_cutrun]
+                    y_true = target_y
+                else:
+                    one_hot, signal = batch_data
+                    x_batches = [one_hot]
+                    y_true = signal
+                
                 x_batches = [x.to(config.device) for x in x_batches]
-                y = y.to(config.device)
-                profile_logits, pred_counts = model(*x_batches)
+                y_true = y_true.to(config.device)
+                
+                profile_logits, pred_outputs = model(*x_batches)
 
                 # Calculate components separately
-                c_loss = criterion.compute_counts_loss(pred_counts, y)
-                p_loss = criterion.compute_profile_loss(profile_logits, y)
+                if isinstance(dataset, SequenceBigWigClusterDataset):
+                    c_loss = criterion.compute_class_loss(pred_outputs, label_true)
+                    p_loss = torch.tensor(0.0, device=c_loss.device)
+                else: 
+                    c_loss = criterion.compute_counts_loss(pred_outputs, y_true)
+                    p_loss = criterion.compute_profile_loss(profile_logits, y_true)
                 
                 val_counts_loss_sum += c_loss.item()
                 val_profile_loss_sum += p_loss.item()
                 val_loss_sum += (c_loss + p_loss).item()
                 val_batches += 1
-                n_val_samples += y.shape[0]
+                n_val_samples += y_true.shape[0]
 
         avg_val_loss = val_loss_sum / max(n_val_samples, 1)
         avg_val_counts_loss = val_counts_loss_sum / max(n_val_samples, 1)
@@ -236,11 +314,17 @@ def train_cnn_regressor(
         summary_bar.close()
 
         if epoch % 1 == 0:
-            print(
-                f"Epoch {epoch + 1}/{config.epochs} "
-                f"- train: {avg_train_loss:.0f} | val: {avg_val_loss:.0f} "
-                f"(counts: {avg_val_counts_loss:.0f}, profile: {avg_val_profile_loss:.0f})"
-            )
+            if isinstance(dataset, SequenceBigWigClusterDataset):
+                print(
+                    f"Epoch {epoch + 1}/{config.epochs} "
+                    f"- train: {avg_train_loss:.4f} | val: {avg_val_loss:.4f} "
+                )
+            else:
+                print(
+                    f"Epoch {epoch + 1}/{config.epochs} "
+                    f"- train: {avg_train_loss:.4f} | val: {avg_val_loss:.4f} "
+                    f"(counts: {avg_val_counts_loss:.4f}, profile: {avg_val_profile_loss:.4f})"
+                )
 
         if epochs_no_improve >= config.patience:
             print(
@@ -260,11 +344,29 @@ def train_cnn_regressor(
         n_batches = 0
         with torch.no_grad():
             for batch_data in loader:
-                *x_batches, y = batch_data
+                if isinstance(dataset, SequenceBigWigClusterDataset):
+                    one_hot, label, signal = batch_data
+                    x_batches = [one_hot]
+                    y_true = signal
+                    label_true = label.float().unsqueeze(1).to(config.device)
+                elif isinstance(dataset, SequenceDualBigWigDataset):
+                    sequence, k4_cutrun, target_y = batch_data
+                    x_batches = [sequence, k4_cutrun]
+                    y_true = target_y
+                else:
+                    one_hot, signal = batch_data
+                    x_batches = [one_hot]
+                    y_true = signal
+                
                 x_batches = [x.to(config.device) for x in x_batches]
-                y = y.to(config.device)
-                profile_logits, pred_counts = model(*x_batches)
-                loss = criterion(profile_logits, pred_counts, y)
+                y_true = y_true.to(config.device)
+                
+                profile_logits, pred_outputs = model(*x_batches)
+                if isinstance(dataset, SequenceBigWigClusterDataset):
+                    loss = criterion(profile_logits, pred_outputs, y_true, label_true)
+                else:
+                    loss = criterion(profile_logits, pred_outputs, y_true)
+                
                 total_loss += loss.item()
                 n_batches += 1
         return total_loss / max(n_batches, 1)
@@ -348,8 +450,21 @@ def visualize_split_predictions(
                 if done:
                     break
                 
-                *x_batches, y_true_batch = batch_data
-                x_batches = [x.to(device) for x in x_batches]
+                if isinstance(model, BPNetClusterModel):
+                    one_hot, label, signal = batch_data
+                    x_model_inputs = [one_hot]
+                    y_true_batch = signal
+                    label_batch = label
+                elif isinstance(model, BPNetK4Model):
+                    sequence, k4_cutrun, target_y = batch_data
+                    x_model_inputs = [sequence, k4_cutrun]
+                    y_true_batch = target_y
+                else:
+                    one_hot, signal = batch_data
+                    x_model_inputs = [one_hot]
+                    y_true_batch = signal
+
+                x_model_inputs = [x.to(device) for x in x_model_inputs]
                 y_true_batch = y_true_batch.to(device)
 
                 batch_curr = y_true_batch.shape[0]
@@ -358,10 +473,10 @@ def visualize_split_predictions(
                         done = True
                         break
                     
-                    x_singles = [x[b:b+1] for x in x_batches]
+                    x_singles = [x[b:b+1] for x in x_model_inputs]
                     y_true_single = y_true_batch[b]
                     
-                    profile_logits, pred_counts = model(*x_singles)
+                    profile_logits, pred_outputs = model(*x_singles)
 
                     # Distribution-based visualization (multinomial/kldiv)
                     y_pred = F.softmax(profile_logits.squeeze(), dim=-1)
@@ -384,9 +499,14 @@ def visualize_split_predictions(
                         ax.axvline(x=len(y_true_norm) - sidelines, color='k', linestyle='--', alpha=0.5)
                     
                     true_total = y_true_single.sum().item()
-                    # The model outputs log(1 + counts), so we invert it for the visualization
-                    pred_total = torch.expm1(pred_counts).item()
-                    ax.set_title(f"{split_name} {count+1}\ntrue: {true_total:.2f}, pred: {pred_total:.2f}")
+                    if isinstance(model, BPNetClusterModel):
+                        true_label = label_batch[b].item()
+                        pred_prob = pred_outputs.item()
+                        ax.set_title(f"{split_name} {count+1}\ntrue total: {true_total:.1f}, pred: {pred_prob:.2f} (class: {true_label})")
+                    else:
+                        pred_total = torch.expm1(pred_outputs).item()
+                        ax.set_title(f"{split_name} {count+1}\ntrue: {true_total:.2f}, pred: {pred_total:.2f}")
+                    
                     ax.set_xlabel("Bins")
                     ax.set_ylabel("Signal")
                     # Only show legend on the first plot to save space
@@ -414,18 +534,39 @@ def evaluate_model_metrics(model, loader, device="cpu", min_profile=0,
     model.to(device)
     all_true_log_counts, all_pred_log_counts, all_jsds = [], [], []
 
+    all_true_labels, all_pred_probs = [], []
+    is_classifier = isinstance(model, BPNetClusterModel)
+
     with torch.no_grad():
         for batch_data in loader:
-            *x_batches, y_true_batch = batch_data
-            x_batches = [x.to(device) for x in x_batches]
+            if is_classifier:
+                one_hot, label, signal = batch_data
+                x_model_inputs = [one_hot]
+                y_true_batch = signal
+                label_true = label
+            elif isinstance(model, BPNetK4Model):
+                sequence, k4_cutrun, target_y = batch_data
+                x_model_inputs = [sequence, k4_cutrun]
+                y_true_batch = target_y
+            else:
+                one_hot, signal = batch_data
+                x_model_inputs = [one_hot]
+                y_true_batch = signal
+
+            x_model_inputs = [x.to(device) for x in x_model_inputs]
             y_true_batch = y_true_batch.to(device)
 
-            profile_logits, pred_counts = model(*x_batches)
+            profile_logits, pred_outputs = model(*x_model_inputs)
 
             target_counts = y_true_batch.sum(dim=-1)
 
-            all_pred_log_counts.extend(pred_counts.squeeze(-1).cpu().numpy().tolist())
-            all_true_log_counts.extend(torch.log1p(target_counts).cpu().numpy().tolist())
+            if is_classifier:
+                pred_outputs = F.sigmoid(pred_outputs)
+                all_pred_probs.extend(pred_outputs.squeeze(-1).cpu().numpy().tolist())
+                all_true_labels.extend(label_true.cpu().numpy().tolist())
+            else:
+                all_pred_log_counts.extend(pred_outputs.squeeze(-1).cpu().numpy().tolist())
+                all_true_log_counts.extend(torch.log1p(target_counts).cpu().numpy().tolist())
 
             y_pred_prob = F.softmax(profile_logits.squeeze(1), dim=-1).cpu()
             y_true_prob = (y_true_batch / (target_counts.unsqueeze(-1) + 1e-8)).cpu()
@@ -445,13 +586,19 @@ def evaluate_model_metrics(model, loader, device="cpu", min_profile=0,
                     if not np.isnan(jsd):
                         all_jsds.append(jsd)
 
-    return {
+    result = {
         "profile_jsd": all_jsds,
-        "log_counts_true": all_true_log_counts,
-        "log_counts_pred": all_pred_log_counts,
     }
+    if is_classifier:
+        result["class_true"] = all_true_labels
+        result["class_pred"] = all_pred_probs
+    else:
+        result["log_counts_true"] = all_true_log_counts
+        result["log_counts_pred"] = all_pred_log_counts
+    return result
 
 __all__ = [
+    "create_loaders",
     "train_cnn_regressor",
     "visualize_split_predictions",
     "evaluate_model_metrics",

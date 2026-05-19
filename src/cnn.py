@@ -249,7 +249,8 @@ class BPNetK4Model(BPNetModel):
         total_counts = self.counts_head(h).squeeze(-1) # (B, 1)
 
         return profile_logits, total_counts
-    
+
+
 
 class BPNetLoss(nn.Module):
     def __init__(self, loss_type: str = 'bpnet', min_profile=0, sidelines=0, target_smoothing=False, smoothing_sigma=3.0):
@@ -353,9 +354,68 @@ class BPNetLoss(nn.Module):
 
 
 
+class BPNetClusterModel(BPNetModel):
+    def __init__(
+        self, 
+        seq_len: int, 
+        n_channels: int = 4, 
+        hidden_channels: int = 128, 
+        n_encoder_layers: int = 8, 
+        kernel_size: int = 3,
+        profile_kernel_size: int = 25,
+        sidelines: int = 0,
+        min_profile: int = 0,
+    ):
+
+        super(BPNetClusterModel, self).__init__(
+            seq_len=seq_len,
+            n_channels=n_channels,
+            hidden_channels=hidden_channels,
+            n_encoder_layers=n_encoder_layers,
+            kernel_size=kernel_size,
+            profile_kernel_size=profile_kernel_size,
+            sidelines=sidelines,
+            min_profile=min_profile,
+        )
+
+    def forward(self, x):
+        h = self.encoder(x)
+        
+        profile_logits = self.profile_head(h)
+        label = self.counts_head(h)
+
+        return profile_logits, label
+    
+class ClassifierLoss(BPNetLoss):
+    def __init__(self, min_profile=0, sidelines=0, target_smoothing=False, smoothing_sigma=3.0):
+        super(ClassifierLoss, self).__init__(
+            loss_type='bpnet',
+            min_profile=min_profile,
+            sidelines=sidelines,
+            target_smoothing=target_smoothing,
+            smoothing_sigma=smoothing_sigma
+        )
+
+    def compute_class_loss(self, label_pred: torch.Tensor, label_true: torch.Tensor) -> torch.Tensor:
+        return F.binary_cross_entropy_with_logits(label_pred, label_true, reduction='none').sum()
+
+    def forward(self, y_pred: torch.Tensor, label_pred: torch.Tensor, y_true: torch.Tensor, label_true: torch.Tensor) -> torch.Tensor:
+        """
+        Calculates total loss normalized by batch size.
+        """
+        batch_size = y_true.shape[0]
+        c_loss = self.compute_class_loss(label_pred, label_true)
+        # p_loss = self.compute_profile_loss(y_pred, y_true)
+        
+        return c_loss / batch_size
+
+
 __all__ = [
     "BPNetModel",
     "BPNetK4Model",
+    "BPNetClusterModel",
     "BPNetLoss",
+    "ClassifierLoss",
+    "compute_receptive_field"
 ]
 
